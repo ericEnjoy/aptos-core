@@ -50,9 +50,6 @@ jobs:
       - run: cd ./ecosystem/typescript/sdk && yarn install
       - run: cd ./ecosystem/typescript/sdk && yarn lint
       - run: cd ./ecosystem/typescript/sdk && yarn fmt:check
-      # Run typescript indexer server linting
-      - run: cd ./ecosystem/indexer-server/typescript && yarn install
-      - run: cd ./ecosystem/indexer-server/typescript && yarn lint
 
   community-platform-lint:
     runs-on: ubuntu-latest
@@ -71,12 +68,13 @@ jobs:
       - uses: actions/setup-node@v3
         with:
           node-version-file: .node-version
+      - run: yarn install --frozen-lockfile
+      - run: yarn run prettier --check .
+      - run: yarn run tsc
       - run: bundle exec bundler-audit --update
       - run: bundle exec brakeman -q -w2
       - run: bundle exec rubocop
       - run: bundle exec erblint --lint-all
-      - run: yarn install --frozen-lockfile
-      - run: yarn run tsc
 
   community-platform-test:
     runs-on: ubuntu-latest
@@ -158,13 +156,6 @@ jobs:
         env:
           INDEXER_DATABASE_URL: postgresql://postgres@localhost/postgres
 
-      - uses: ./.github/actions/upload-test-results
-        with:
-          BUILDPULSE_ACCESS_KEY_ID: ${{ secrets.BUILDPULSE_ACCESS_KEY_ID }}
-          BUILDPULSE_SECRET_ACCESS_KEY: ${{ secrets.BUILDPULSE_SECRET_ACCESS_KEY }}
-          DD_API_KEY: ${{ secrets.DD_API_KEY }}
-          SUITE: rust-unit
-
   rust-smoke-test:
     runs-on: high-perf-docker
     steps:
@@ -179,13 +170,6 @@ jobs:
       - run: cargo build --bin=aptos-node --features=failpoints --release && LOCAL_SWARM_NODE_RELEASE=1 cargo nextest run --release --profile ci --package smoke-test --test-threads 6 --retries 3
         env:
           INDEXER_DATABASE_URL: postgresql://postgres@localhost/postgres
-
-      - uses: ./.github/actions/upload-test-results
-        with:
-          BUILDPULSE_ACCESS_KEY_ID: ${{ secrets.BUILDPULSE_ACCESS_KEY_ID }}
-          BUILDPULSE_SECRET_ACCESS_KEY: ${{ secrets.BUILDPULSE_SECRET_ACCESS_KEY }}
-          DD_API_KEY: ${{ secrets.DD_API_KEY }}
-          SUITE: rust-smoke
 
       - name: Upload smoke test logs for failures
         uses: actions/upload-artifact@v3

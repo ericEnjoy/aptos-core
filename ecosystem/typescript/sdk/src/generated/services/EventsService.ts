@@ -2,7 +2,6 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { Address } from '../models/Address';
-import type { EventKey } from '../models/EventKey';
 import type { IdentifierWrapper } from '../models/IdentifierWrapper';
 import type { MoveStructTag } from '../models/MoveStructTag';
 import type { U64 } from '../models/U64';
@@ -16,29 +15,38 @@ export class EventsService {
     constructor(public readonly httpRequest: BaseHttpRequest) {}
 
     /**
-     * Get events by event key
-     * This endpoint allows you to get a list of events of a specific type
-     * as identified by its event key, which is a globally unique ID.
-     * @param eventKey Event key to retrieve events by
+     * Get events by creation number
+     * Event types are globally identifiable by an account `address` and
+     * monotonically increasing `creation_number`, one per event type emitted
+     * to the given account. This API returns events corresponding to that
+     * that event type.
+     * @param address Hex-encoded 32 byte Aptos account, with or without a `0x` prefix, for
+     * which events are queried. This refers to the account that events were
+     * emitted to, not the account hosting the move module that emits that
+     * event type.
+     * @param creationNumber Creation number corresponding to the event stream originating
+     * from the given account.
      * @param start Starting sequence number of events.
      *
-     * By default, will retrieve the most recent events
+     * If unspecified, by default will retrieve the most recent events
      * @param limit Max number of events to retrieve.
      *
-     * Mo value defaults to default page size
+     * If unspecified, defaults to default page size
      * @returns VersionedEvent
      * @throws ApiError
      */
-    public getEventsByEventKey(
-        eventKey: EventKey,
+    public getEventsByCreationNumber(
+        address: Address,
+        creationNumber: U64,
         start?: U64,
         limit?: number,
     ): CancelablePromise<Array<VersionedEvent>> {
         return this.httpRequest.request({
             method: 'GET',
-            url: '/events/{event_key}',
+            url: '/accounts/{address}/events/{creation_number}',
             path: {
-                'event_key': eventKey,
+                'address': address,
+                'creation_number': creationNumber,
             },
             query: {
                 'start': start,
@@ -49,18 +57,21 @@ export class EventsService {
 
     /**
      * Get events by event handle
-     * This API extracts event key from the account resource identified
-     * by the `event_handle_struct` and `field_name`, then returns
-     * events identified by the event key.
-     * @param address Address of account with or without a `0x` prefix
+     * This API uses the given account `address`, `eventHandle`, and `fieldName`
+     * to build a key that can globally identify an event types. It then uses this
+     * key to return events emitted to the given account matching that event type.
+     * @param address Hex-encoded 32 byte Aptos account, with or without a `0x` prefix, for
+     * which events are queried. This refers to the account that events were
+     * emitted to, not the account hosting the move module that emits that
+     * event type.
      * @param eventHandle Name of struct to lookup event handle e.g. `0x1::account::Account`
      * @param fieldName Name of field to lookup event handle e.g. `withdraw_events`
      * @param start Starting sequence number of events.
      *
-     * By default, will retrieve the most recent events
+     * If unspecified, by default will retrieve the most recent
      * @param limit Max number of events to retrieve.
      *
-     * Mo value defaults to default page size
+     * If unspecified, defaults to default page size
      * @returns VersionedEvent
      * @throws ApiError
      */

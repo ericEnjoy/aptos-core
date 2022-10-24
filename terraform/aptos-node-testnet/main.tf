@@ -5,9 +5,9 @@ provider "aws" {
 data "aws_caller_identity" "current" {}
 
 locals {
-  workspace  = var.workspace_name_override != "" ? var.workspace_name_override : terraform.workspace
-  aws_tags   = "Terraform=testnet,Workspace=${local.workspace}"
-  chain_name = var.chain_name != "" ? var.chain_name : "${local.workspace}net"
+  workspace_name = var.workspace_name_override != "" ? var.workspace_name_override : terraform.workspace
+  aws_tags       = "Terraform=testnet,Workspace=${local.workspace_name}"
+  chain_name     = var.chain_name != "" ? var.chain_name : "${local.workspace_name}net"
 }
 
 # Forge testing overrides
@@ -47,6 +47,9 @@ module "validator" {
   image_tag      = var.image_tag
   validator_name = "aptos-node"
 
+  validator_storage_class = var.validator_storage_class
+  fullnode_storage_class  = var.fullnode_storage_class
+
   num_validators      = var.num_validators
   num_fullnode_groups = var.num_fullnode_groups
   helm_values         = var.aptos_node_helm_values
@@ -65,7 +68,6 @@ module "validator" {
   enable_monitoring               = true
   enable_prometheus_node_exporter = true
   enable_kube_state_metrics       = true
-  enable_logger                   = true
   monitoring_helm_values          = var.monitoring_helm_values
   logger_helm_values              = var.logger_helm_values
 }

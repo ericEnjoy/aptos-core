@@ -4,12 +4,103 @@
 //! This module defines all the gas parameters for transactions, along with their initial values
 //! in the genesis and a mapping between the Rust representation and the on-chain gas schedule.
 
-use crate::algebra::{FeePerGasUnit, Gas, GasScalingFactor, GasUnit};
-use aptos_types::{state_store::state_key::StateKey, write_set::WriteOp};
+use crate::algebra::{AbstractValueSize, FeePerGasUnit, Gas, GasScalingFactor, GasUnit};
+use aptos_types::{
+    on_chain_config::StorageGasSchedule, state_store::state_key::StateKey, write_set::WriteOp,
+};
 use move_core_types::gas_algebra::{
     InternalGas, InternalGasPerArg, InternalGasPerByte, InternalGasUnit, NumArgs, NumBytes,
     ToUnitFractionalWithParams, ToUnitWithParams,
 };
+
+#[derive(Clone, Debug)]
+pub struct StorageGasParameters {
+    pub per_item_read: InternalGasPerArg,
+    pub per_item_create: InternalGasPerArg,
+    pub per_item_write: InternalGasPerArg,
+    pub per_byte_read: InternalGasPerByte,
+    pub per_byte_create: InternalGasPerByte,
+    pub per_byte_write: InternalGasPerByte,
+}
+
+impl From<StorageGasSchedule> for StorageGasParameters {
+    fn from(gas_schedule: StorageGasSchedule) -> Self {
+        Self {
+            per_item_read: gas_schedule.per_item_read.into(),
+            per_item_create: gas_schedule.per_item_create.into(),
+            per_item_write: gas_schedule.per_item_write.into(),
+            per_byte_read: gas_schedule.per_byte_read.into(),
+            per_byte_create: gas_schedule.per_byte_create.into(),
+            per_byte_write: gas_schedule.per_byte_write.into(),
+        }
+    }
+}
+
+impl StorageGasParameters {
+    pub fn zeros() -> Self {
+        Self {
+            per_item_read: 0.into(),
+            per_item_create: 0.into(),
+            per_item_write: 0.into(),
+            per_byte_read: 0.into(),
+            per_byte_create: 0.into(),
+            per_byte_write: 0.into(),
+        }
+    }
+}
+
+impl StorageGasParameters {
+    pub fn calculate_write_set_gas<'a>(
+        &self,
+        ops: impl IntoIterator<Item = (&'a StateKey, &'a WriteOp)>,
+        feature_version: u64,
+    ) -> InternalGas {
+        use WriteOp::*;
+
+        let mut num_items_create = NumArgs::zero();
+        let mut num_items_write = NumArgs::zero();
+        let mut num_bytes_create = NumBytes::zero();
+        let mut num_bytes_write = NumBytes::zero();
+
+        for (key, op) in ops.into_iter() {
+            match &op {
+                Creation(data) => {
+                    num_items_create += 1.into();
+                    num_bytes_create += Self::write_op_size(key, data, feature_version);
+                }
+                Modification(data) => {
+                    num_items_write += 1.into();
+                    num_bytes_write += Self::write_op_size(key, data, feature_version);
+                }
+                Deletion => (),
+            }
+        }
+
+        num_items_create * self.per_item_create
+            + num_items_write * self.per_item_write
+            + num_bytes_create * self.per_byte_create
+            + num_bytes_write * self.per_byte_write
+    }
+
+    fn write_op_size(key: &StateKey, value: &[u8], feature_version: u64) -> NumBytes {
+        let value_size = NumBytes::new(value.len() as u64);
+
+        if feature_version > 2 {
+            let key_size = NumBytes::new(key.size() as u64);
+            let kb = NumBytes::new(1024);
+            (key_size + value_size)
+                .checked_sub(kb)
+                .unwrap_or(NumBytes::zero())
+        } else {
+            let key_size = NumBytes::new(
+                key.encode()
+                    .expect("Should be able to serialize state key")
+                    .len() as u64,
+            );
+            key_size + value_size
+        }
+    }
+}
 
 crate::params::define_gas_parameters!(
     TransactionGasParameters,
@@ -20,7 +111,7 @@ crate::params::define_gas_parameters!(
         [
             min_transaction_gas_units: InternalGas,
             "min_transaction_gas_units",
-            600
+            1_500_000
         ],
         // Any transaction over this size will be charged an additional amount per byte.
         [
@@ -33,7 +124,7 @@ crate::params::define_gas_parameters!(
         [
             intrinsic_gas_per_byte: InternalGasPerByte,
             "intrinsic_gas_per_byte",
-            8
+            2_000
         ],
         // ~5 microseconds should equal one unit of computational gas. We bound the maximum
         // computational time of any given transaction at roughly 20 seconds. We want this number and
@@ -42,60 +133,61 @@ crate::params::define_gas_parameters!(
         [
             maximum_number_of_gas_units: Gas,
             "maximum_number_of_gas_units",
-            4_000_000
+            2_000_000
         ],
         // The minimum gas price that a transaction can be submitted with.
         // TODO(Gas): should probably change this to something > 0
         [
             min_price_per_gas_unit: FeePerGasUnit,
             "min_price_per_gas_unit",
-            0
+            aptos_global_constants::GAS_UNIT_PRICE
         ],
         // The maximum gas unit price that a transaction can be submitted with.
         [
             max_price_per_gas_unit: FeePerGasUnit,
             "max_price_per_gas_unit",
-            10_000
+            10_000_000_000
         ],
         [
             max_transaction_size_in_bytes: NumBytes,
             "max_transaction_size_in_bytes",
-            32 * 1024
+            64 * 1024
         ],
         [
             gas_unit_scaling_factor: GasScalingFactor,
             "gas_unit_scaling_factor",
-            1000
+            10_000
         ],
         // Gas Parameters for reading data from storage.
-        [load_data_base: InternalGas, "load_data.base", 1],
+        [load_data_base: InternalGas, "load_data.base", 16_000],
         [
             load_data_per_byte: InternalGasPerByte,
             "load_data.per_byte",
-            1
+            1_000
         ],
-        [load_data_failure: InternalGas, "load_data.failure", 1],
+        [load_data_failure: InternalGas, "load_data.failure", 0],
         // Gas parameters for writing data to storage.
         [
             write_data_per_op: InternalGasPerArg,
             "write_data.per_op",
-            100
+            160_000
         ],
         [
             write_data_per_new_item: InternalGasPerArg,
             "write_data.new_item",
-            1000
+            1_280_000
         ],
         [
             write_data_per_byte_in_key: InternalGasPerByte,
             "write_data.per_byte_in_key",
-            100
+            10_000
         ],
         [
             write_data_per_byte_in_val: InternalGasPerByte,
             "write_data.per_byte_in_val",
-            100
+            10_000
         ],
+        [memory_quota: AbstractValueSize, optional "memory_quota", 10_000_000],
     ]
 );
 

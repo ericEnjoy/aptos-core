@@ -8,10 +8,14 @@ use cached_packages::aptos_stdlib;
 use clap::Parser;
 
 // TODO(Gas): double check if this is correct
-pub const DEFAULT_FUNDED_COINS: u64 = 50_000;
+// TODO(greg): revisit after fixing gas estimation
+pub const DEFAULT_FUNDED_COINS: u64 = 500_000;
 
-/// Command to create a new account on-chain
+/// Create a new account on-chain
 ///
+/// An account can be created by transferring coins, or by making an explicit
+/// call to create an account.  This will create an account with no coins, and
+/// any coins will have to transferred afterwards.
 #[derive(Debug, Parser)]
 pub struct CreateAccount {
     /// Address of the new account
@@ -31,7 +35,7 @@ impl CliCommand<TransactionSummary> for CreateAccount {
     async fn execute(self) -> CliTypedResult<TransactionSummary> {
         let address = self.account;
         self.txn_options
-            .submit_transaction(aptos_stdlib::aptos_account_create_account(address), None)
+            .submit_transaction(aptos_stdlib::aptos_account_create_account(address))
             .await
             .map(TransactionSummary::from)
     }

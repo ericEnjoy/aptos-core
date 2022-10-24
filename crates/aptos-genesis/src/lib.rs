@@ -6,14 +6,15 @@
 pub mod builder;
 pub mod config;
 pub mod keys;
+pub mod mainnet;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod test_utils;
 
 use crate::{builder::GenesisConfiguration, config::ValidatorConfiguration};
 use aptos_config::config::{
-    RocksdbConfigs, DEFAULT_MAX_NUM_NODES_PER_LRU_CACHE_SHARD, NO_OP_STORAGE_PRUNER_CONFIG,
-    TARGET_SNAPSHOT_SIZE,
+    RocksdbConfigs, BUFFERED_STATE_TARGET_ITEMS, DEFAULT_MAX_NUM_NODES_PER_LRU_CACHE_SHARD,
+    NO_OP_STORAGE_PRUNER_CONFIG,
 };
 use aptos_crypto::ed25519::Ed25519PublicKey;
 use aptos_temppath::TempPath;
@@ -123,6 +124,8 @@ impl GenesisInfo {
                 rewards_apy_percentage: self.rewards_apy_percentage,
                 voting_duration_secs: self.voting_duration_secs,
                 voting_power_increase_limit: self.voting_power_increase_limit,
+                employee_vesting_start: 1663456089,
+                employee_vesting_period_duration: 5 * 60, // 5 minutes
             },
         )
     }
@@ -136,7 +139,7 @@ impl GenesisInfo {
             NO_OP_STORAGE_PRUNER_CONFIG,
             RocksdbConfigs::default(),
             false,
-            TARGET_SNAPSHOT_SIZE,
+            BUFFERED_STATE_TARGET_ITEMS,
             DEFAULT_MAX_NUM_NODES_PER_LRU_CACHE_SHARD,
         )?;
         let db_rw = DbReaderWriter::new(aptosdb);

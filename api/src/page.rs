@@ -7,18 +7,20 @@ use serde::Deserialize;
 
 const DEFAULT_PAGE_SIZE: u16 = 25;
 
-/// This MAX_PAGE_SIZE must always be smaller than the `aptos_db::MAX_LIMIT` in the DB
-const MAX_PAGE_SIZE: u16 = 1000;
-
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct Page {
     start: Option<u64>,
     limit: Option<u16>,
+    max_page_size: u16,
 }
 
 impl Page {
-    pub fn new(start: Option<u64>, limit: Option<u16>) -> Self {
-        Self { start, limit }
+    pub fn new(start: Option<u64>, limit: Option<u16>, max_page_size: u16) -> Self {
+        Self {
+            start,
+            limit,
+            max_page_size,
+        }
     }
 
     /// Compute the start of the page for transactions
@@ -33,7 +35,7 @@ impl Page {
     }
 
     /// Retrieve the start of the page
-    pub fn start<E: BadRequestError>(
+    fn start<E: BadRequestError>(
         &self,
         default: u64,
         max: u64,
@@ -68,16 +70,11 @@ impl Page {
                 ledger_info,
             ));
         }
-        if limit > MAX_PAGE_SIZE {
-            return Err(E::bad_request_with_code(
-                &format!(
-                    "Given limit value ({}) is too large, it must be < {}",
-                    limit, MAX_PAGE_SIZE
-                ),
-                AptosErrorCode::InvalidInput,
-                ledger_info,
-            ));
+        // If we go over the max page size, we return the max page size
+        if limit > self.max_page_size {
+            Ok(self.max_page_size)
+        } else {
+            Ok(limit)
         }
-        Ok(limit)
     }
 }

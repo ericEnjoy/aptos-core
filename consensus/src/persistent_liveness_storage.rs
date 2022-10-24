@@ -6,9 +6,9 @@ use anyhow::{format_err, Context, Result};
 use aptos_config::config::NodeConfig;
 use aptos_crypto::HashValue;
 use aptos_logger::prelude::*;
-use aptos_types::proof::TransactionAccumulatorSummary;
 use aptos_types::{
-    epoch_change::EpochChangeProof, ledger_info::LedgerInfoWithSignatures, transaction::Version,
+    block_info::Round, epoch_change::EpochChangeProof, ledger_info::LedgerInfoWithSignatures,
+    proof::TransactionAccumulatorSummary, transaction::Version,
 };
 use consensus_types::{
     block::Block, quorum_cert::QuorumCert, timeout_2chain::TwoChainTimeoutCertificate, vote::Vote,
@@ -64,6 +64,10 @@ pub struct LedgerRecoveryData {
 impl LedgerRecoveryData {
     pub fn new(storage_ledger: LedgerInfoWithSignatures) -> Self {
         LedgerRecoveryData { storage_ledger }
+    }
+
+    pub fn committed_round(&self) -> Round {
+        self.storage_ledger.commit_info().round()
     }
 
     /// Finds the root (last committed block) and returns the root block, the QC to the root block
@@ -196,21 +200,19 @@ impl RecoveryData {
             .find_root(&mut blocks, &mut quorum_certs)
             .with_context(|| {
                 // for better readability
+                blocks.sort_by_key(|block| block.round());
                 quorum_certs.sort_by_key(|qc| qc.certified_block().round());
                 format!(
-                    "\nRoot id: {}\nBlocks in db: {}\nQuorum Certs in db: {}\n",
-                    ledger_recovery_data
-                        .storage_ledger
-                        .ledger_info()
-                        .consensus_block_id(),
+                    "\nRoot: {}\nBlocks in db: {}\nQuorum Certs in db: {}\n",
+                    ledger_recovery_data.storage_ledger.ledger_info(),
                     blocks
                         .iter()
-                        .map(|b| format!("\n\t{}", b))
+                        .map(|b| format!("\n{}", b))
                         .collect::<Vec<String>>()
                         .concat(),
                     quorum_certs
                         .iter()
-                        .map(|qc| format!("\n\t{}", qc))
+                        .map(|qc| format!("\n{}", qc))
                         .collect::<Vec<String>>()
                         .concat(),
                 )
@@ -273,7 +275,7 @@ impl RecoveryData {
     ) -> Vec<HashValue> {
         // prune all the blocks that don't have root as ancestor
         let mut tree = HashSet::new();
-        let mut to_remove = vec![];
+        let mut to_remove = HashSet::new();
         tree.insert(root_id);
         // assume blocks are sorted by round already
         blocks.retain(|block| {
@@ -281,12 +283,19 @@ impl RecoveryData {
                 tree.insert(block.id());
                 true
             } else {
-                to_remove.push(block.id());
+                to_remove.insert(block.id());
                 false
             }
         });
-        quorum_certs.retain(|qc| tree.contains(&qc.certified_block().id()));
-        to_remove
+        quorum_certs.retain(|qc| {
+            if tree.contains(&qc.certified_block().id()) {
+                true
+            } else {
+                to_remove.insert(qc.certified_block().id());
+                false
+            }
+        });
+        to_remove.into_iter().collect()
     }
 }
 
@@ -399,11 +408,11 @@ impl PersistentLivenessStorage for StorageWriteProxy {
                     initial_data.highest_2chain_timeout_certificate().as_ref().map_or("None".to_string(), |v| v.to_string()),
                 );
 
-                LivenessStorageData::RecoveryData(initial_data)
+                LivenessStorageData::FullRecoveryData(initial_data)
             }
             Err(e) => {
                 error!(error = ?e, "Failed to construct recovery data");
-                LivenessStorageData::LedgerRecoveryData(ledger_recovery_data)
+                LivenessStorageData::PartialRecoveryData(ledger_recovery_data)
             }
         }
     }

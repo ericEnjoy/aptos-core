@@ -52,16 +52,30 @@ async fn block(request: BlockRequest, server_context: RosettaContext) -> ApiResu
     )
     .await?;
 
-    let block = build_block(parent_transaction, block, server_context.chain_id).await?;
+    let keep_empty_transactions = request
+        .metadata
+        .as_ref()
+        .and_then(|inner| inner.keep_empty_transactions)
+        .unwrap_or_default();
+    let block = build_block(
+        &server_context,
+        parent_transaction,
+        block,
+        server_context.chain_id,
+        keep_empty_transactions,
+    )
+    .await?;
 
     Ok(BlockResponse { block })
 }
 
 /// Build up the transaction, which should contain the `operations` as the change set
 async fn build_block(
+    server_context: &RosettaContext,
     parent_block_identifier: BlockIdentifier,
     block: aptos_rest_client::aptos_api_types::BcsBlock,
     chain_id: ChainId,
+    keep_empty_transactions: bool,
 ) -> ApiResult<Block> {
     // note: timestamps are in microseconds, so we convert to milliseconds
     let timestamp = get_timestamp(block.block_timestamp);
@@ -69,11 +83,18 @@ async fn build_block(
 
     // Convert the transactions and build the block
     let mut transactions: Vec<Transaction> = Vec::new();
+    // TODO: Parallelize these and then sort at end
     if let Some(txns) = block.transactions {
         for txn in txns {
-            transactions.push(Transaction::from_transaction(txn).await?)
+            let transaction = Transaction::from_transaction(server_context, txn).await?;
+            if keep_empty_transactions || !transaction.operations.is_empty() {
+                transactions.push(transaction)
+            }
         }
     }
+
+    // Ensure the transactions are sorted in order
+    transactions.sort_by(|first, second| first.metadata.version.0.cmp(&second.metadata.version.0));
 
     Ok(Block {
         block_identifier,
@@ -137,12 +158,16 @@ impl BlockInfo {
 /// A cache of [`BlockInfo`] to allow us to keep track of the block boundaries
 #[derive(Debug)]
 pub struct BlockRetriever {
+    page_size: u16,
     rest_client: Arc<aptos_rest_client::Client>,
 }
 
 impl BlockRetriever {
-    pub fn new(rest_client: Arc<aptos_rest_client::Client>) -> Self {
-        BlockRetriever { rest_client }
+    pub fn new(page_size: u16, rest_client: Arc<aptos_rest_client::Client>) -> Self {
+        BlockRetriever {
+            page_size,
+            rest_client,
+        }
     }
 
     pub async fn get_block_info_by_height(
@@ -171,12 +196,18 @@ impl BlockRetriever {
         height: u64,
         with_transactions: bool,
     ) -> ApiResult<aptos_rest_client::aptos_api_types::BcsBlock> {
-        let block = self
-            .rest_client
-            .get_block_by_height_bcs(height, with_transactions)
-            .await?
-            .into_inner();
-
-        Ok(block)
+        if with_transactions {
+            Ok(self
+                .rest_client
+                .get_full_block_by_height_bcs(height, self.page_size)
+                .await?
+                .into_inner())
+        } else {
+            Ok(self
+                .rest_client
+                .get_block_by_height_bcs(height, false)
+                .await?
+                .into_inner())
+        }
     }
 }

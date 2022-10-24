@@ -121,9 +121,9 @@ pub trait SubstreamProcessor: Send + Sync + Debug {
 
     /// Actually performs the write for a `IndexerState` changeset
     fn apply_processor_status(&self, psm: &IndexerState) {
-        let conn = get_conn(self.connection_pool());
+        let mut conn = get_conn(self.connection_pool());
         execute_with_better_error(
-            &conn,
+            &mut conn,
             diesel::insert_into(indexer_states::table)
                 .values(psm)
                 .on_conflict((
@@ -136,12 +136,12 @@ pub trait SubstreamProcessor: Send + Sync + Debug {
         .expect("Error updating Processor Status!");
     }
 
-    /// If chain id doesn't exist, save it. Otherwise make sure that we're indexing the same chain
+    /// If chain id doesn't exist, save it. Otherwise, make sure that we're indexing the same chain
     /// If check is successful, we will call set_is_chain_id_verified to attempt to persist the result
     /// of the check. Make sure to implement this function and call is_chain_id_verified to read the flag.
     fn check_or_update_chain_id(&mut self, input_chain_id: i64) {
         info!("Checking if chain id is correct");
-        let conn = self
+        let mut conn = self
             .connection_pool()
             .get()
             .expect("DB connection is not available to query chain id");
@@ -164,7 +164,7 @@ pub trait SubstreamProcessor: Send + Sync + Debug {
                     "Adding chain id to db, continue to index",
                 );
                 execute_with_better_error(
-                    &conn,
+                    &mut conn,
                     diesel::insert_into(ledger_infos::table).values(LedgerInfo {
                         chain_id: input_chain_id,
                     }),

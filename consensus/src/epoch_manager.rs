@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    block_storage::BlockStore,
+    block_storage::{
+        tracing::{observe_block, BlockStage},
+        BlockStore,
+    },
     commit_notifier::CommitNotifier,
     counters,
     error::{error_kind, DbError},
@@ -31,6 +34,7 @@ use crate::{
     payload_manager::QuorumStoreClient,
     persistent_liveness_storage::{LedgerRecoveryData, PersistentLivenessStorage, RecoveryData},
     quorum_store::direct_mempool_quorum_store::DirectMempoolQuorumStore,
+    recovery_manager::RecoveryManager,
     round_manager::{RoundManager, UnverifiedEvent, VerifiedEvent},
     state_replication::StateComputer,
     util::time_service::TimeService,
@@ -86,17 +90,8 @@ const PROPSER_ROUND_BEHIND_STORAGE_BUFFER: usize = 10;
 
 #[allow(clippy::large_enum_variant)]
 pub enum LivenessStorageData {
-    RecoveryData(RecoveryData),
-    LedgerRecoveryData(LedgerRecoveryData),
-}
-
-impl LivenessStorageData {
-    pub fn expect_recovery_data(self, msg: &str) -> RecoveryData {
-        match self {
-            LivenessStorageData::RecoveryData(data) => data,
-            LivenessStorageData::LedgerRecoveryData(_) => panic!("{}", msg),
-        }
-    }
+    FullRecoveryData(RecoveryData),
+    PartialRecoveryData(LedgerRecoveryData),
 }
 
 // Manager the components that shared across epoch and spawn per-epoch RoundManager with
@@ -539,6 +534,35 @@ impl EpochManager {
         self.block_retrieval_tx = None;
     }
 
+    async fn start_recovery_manager(
+        &mut self,
+        ledger_data: LedgerRecoveryData,
+        epoch_state: EpochState,
+    ) {
+        let network_sender = NetworkSender::new(
+            self.author,
+            self.network_sender.clone(),
+            self.self_sender.clone(),
+            epoch_state.verifier.clone(),
+        );
+        let (recovery_manager_tx, recovery_manager_rx) = aptos_channel::new(
+            QueueStyle::LIFO,
+            1,
+            Some(&counters::ROUND_MANAGER_CHANNEL_MSGS),
+        );
+        self.round_manager_tx = Some(recovery_manager_tx);
+        let (close_tx, close_rx) = oneshot::channel();
+        self.round_manager_close_tx = Some(close_tx);
+        let recovery_manager = RecoveryManager::new(
+            epoch_state,
+            network_sender,
+            self.storage.clone(),
+            self.commit_state_computer.clone(),
+            ledger_data.committed_round(),
+        );
+        tokio::spawn(recovery_manager.start(recovery_manager_rx, close_rx));
+    }
+
     async fn start_round_manager(
         &mut self,
         recovery_data: RecoveryData,
@@ -622,9 +646,25 @@ impl EpochManager {
             block_store.clone(),
             Arc::new(payload_manager),
             self.time_service.clone(),
-            self.config.max_block_txns,
-            self.config.max_block_bytes,
+            self.config.max_sending_block_txns,
+            self.config.max_sending_block_bytes,
             onchain_config.max_failed_authors_to_store(),
+        );
+
+        let (round_manager_tx, round_manager_rx) = aptos_channel::new(
+            QueueStyle::LIFO,
+            1,
+            Some(&counters::ROUND_MANAGER_CHANNEL_MSGS),
+        );
+
+        self.round_manager_tx = Some(round_manager_tx.clone());
+
+        counters::TOTAL_VOTING_POWER.set(epoch_state.verifier.total_voting_power() as f64);
+        counters::VALIDATOR_VOTING_POWER.set(
+            epoch_state
+                .verifier
+                .get_voting_power(&self.author)
+                .unwrap_or(0) as f64,
         );
 
         let mut round_manager = RoundManager::new(
@@ -636,17 +676,13 @@ impl EpochManager {
             safety_rules_container,
             network_sender,
             self.storage.clone(),
-            self.config.sync_only,
             onchain_config,
+            round_manager_tx,
+            self.config.clone(),
         );
 
         round_manager.init(last_vote).await;
-        let (round_manager_tx, round_manager_rx) = aptos_channel::new(
-            QueueStyle::LIFO,
-            1,
-            Some(&counters::ROUND_MANAGER_CHANNEL_MSGS),
-        );
-        self.round_manager_tx = Some(round_manager_tx);
+
         let (close_tx, close_rx) = oneshot::channel();
         self.round_manager_close_tx = Some(close_tx);
         tokio::spawn(round_manager.start(round_manager_rx, close_rx));
@@ -670,16 +706,19 @@ impl EpochManager {
 
         self.epoch_state = Some(epoch_state.clone());
 
-        let initial_data = self
-            .storage
-            .start()
-            .expect_recovery_data("Consensusdb is corrupted, need to do a backup and restore");
-        self.start_round_manager(
-            initial_data,
-            epoch_state,
-            onchain_config.unwrap_or_default(),
-        )
-        .await;
+        match self.storage.start() {
+            LivenessStorageData::FullRecoveryData(initial_data) => {
+                self.start_round_manager(
+                    initial_data,
+                    epoch_state,
+                    onchain_config.unwrap_or_default(),
+                )
+                .await
+            }
+            LivenessStorageData::PartialRecoveryData(ledger_data) => {
+                self.start_recovery_manager(ledger_data, epoch_state).await
+            }
+        }
     }
 
     async fn process_message(
@@ -690,6 +729,13 @@ impl EpochManager {
         fail_point!("consensus::process::any", |_| {
             Err(anyhow::anyhow!("Injected error in process_message"))
         });
+
+        if let ConsensusMsg::ProposalMsg(proposal) = &consensus_msg {
+            observe_block(
+                proposal.proposal().timestamp_usecs(),
+                BlockStage::EPOCH_MANAGER_RECEIVED,
+            );
+        }
         // we can't verify signatures from a different epoch
         let maybe_unverified_event = self.check_epoch(peer_id, consensus_msg).await?;
 
@@ -779,6 +825,12 @@ impl EpochManager {
         peer_id: AccountAddress,
         event: VerifiedEvent,
     ) -> anyhow::Result<()> {
+        if let VerifiedEvent::ProposalMsg(proposal) = &event {
+            observe_block(
+                proposal.proposal().timestamp_usecs(),
+                BlockStage::EPOCH_MANAGER_VERIFIED,
+            );
+        }
         match event {
             buffer_manager_event @ (VerifiedEvent::CommitVote(_)
             | VerifiedEvent::CommitDecision(_)) => {

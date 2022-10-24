@@ -85,12 +85,15 @@ pub struct ErrorWrapper {
 /// Arguments for requesting a block
 #[derive(Debug, Parser)]
 pub struct BlockArgs {
-    /// The index of the block to request
+    /// The height of the block to request
     #[clap(long)]
     block_index: Option<u64>,
     /// The hash of the block to request
     #[clap(long)]
     block_hash: Option<String>,
+
+    #[clap(long)]
+    pub keep_all_transactions: Option<bool>,
 }
 
 impl From<BlockArgs> for Option<PartialBlockIdentifier> {

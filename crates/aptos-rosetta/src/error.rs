@@ -5,14 +5,14 @@ use crate::{types, types::ErrorDetails};
 use aptos_rest_client::aptos_api_types::AptosErrorCode;
 use aptos_rest_client::error::RestError;
 use hex::FromHexError;
-use move_deps::move_core_types::account_address::AccountAddressParseError;
+use move_core_types::account_address::AccountAddressParseError;
 use serde::{Deserialize, Serialize};
 use std::fmt::Formatter;
 use warp::{http::StatusCode, reply::Reply};
 
 pub type ApiResult<T> = Result<T, ApiError>;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum ApiError {
     TransactionIsPending,
     NetworkIdentifierMismatch,
@@ -21,7 +21,7 @@ pub enum ApiError {
     InvalidTransferOperations(Option<&'static str>),
     InvalidSignatureType,
     InvalidMaxGasFees,
-    MaxGasFeeTooLow,
+    MaxGasFeeTooLow(Option<String>),
     InvalidGasMultiplier,
     GasEstimationFailed(Option<String>),
     InvalidOperations(Option<String>),
@@ -31,6 +31,7 @@ pub enum ApiError {
     NodeIsOffline,
     TransactionParseError(Option<String>),
     InternalError(Option<String>),
+    CoinTypeFailedToBeFetched(Option<String>),
 
     // Below here are codes directly from the REST API
     AccountNotFound(Option<String>),
@@ -69,7 +70,7 @@ impl ApiError {
             InvalidTransferOperations(None),
             InvalidSignatureType,
             InvalidMaxGasFees,
-            MaxGasFeeTooLow,
+            MaxGasFeeTooLow(None),
             InvalidGasMultiplier,
             GasEstimationFailed(None),
             InvalidOperations(None),
@@ -79,6 +80,7 @@ impl ApiError {
             NodeIsOffline,
             TransactionParseError(None),
             InternalError(None),
+            CoinTypeFailedToBeFetched(None),
             AccountNotFound(None),
             ResourceNotFound(None),
             ModuleNotFound(None),
@@ -107,7 +109,7 @@ impl ApiError {
             InvalidTransferOperations(_) => 5,
             InvalidSignatureType => 6,
             InvalidMaxGasFees => 7,
-            MaxGasFeeTooLow => 8,
+            MaxGasFeeTooLow(_) => 8,
             InvalidGasMultiplier => 9,
             InvalidOperations(_) => 10,
             MissingPayloadMetadata => 11,
@@ -132,6 +134,7 @@ impl ApiError {
             SequenceNumberTooOld(_) => 30,
             VmError(_) => 31,
             MempoolIsFull(_) => 32,
+            CoinTypeFailedToBeFetched(_) => 33,
         }
     }
 
@@ -139,7 +142,11 @@ impl ApiError {
         use ApiError::*;
         matches!(
             self,
-            AccountNotFound(_) | BlockNotFound(_) | MempoolIsFull(_) | GasEstimationFailed(_)
+            AccountNotFound(_)
+                | BlockNotFound(_)
+                | MempoolIsFull(_)
+                | GasEstimationFailed(_)
+                | CoinTypeFailedToBeFetched(_)
         )
     }
 
@@ -159,7 +166,7 @@ impl ApiError {
             ApiError::AccountNotFound(_) => "Account not found",
             ApiError::InvalidSignatureType => "Invalid signature type",
             ApiError::InvalidMaxGasFees => "Invalid max gas fee",
-            ApiError::MaxGasFeeTooLow => "Max fee is lower than the estimated cost of the transaction",
+            ApiError::MaxGasFeeTooLow(_) => "Max fee is lower than the estimated cost of the transaction",
             ApiError::InvalidGasMultiplier => "Invalid gas multiplier",
             ApiError::InvalidOperations(_) => "Invalid operations",
             ApiError::MissingPayloadMetadata => "Payload metadata is missing",
@@ -169,6 +176,7 @@ impl ApiError {
             ApiError::BlockNotFound(_) => "Block is missing events",
             ApiError::TransactionParseError(_) => "Transaction failed to parse",
             ApiError::InternalError(_) => "Internal error",
+            ApiError::CoinTypeFailedToBeFetched(_) => "Faileed to retrieve the coin type information, please retry",
             ApiError::ResourceNotFound(_) => "Resource not found",
             ApiError::ModuleNotFound(_) => "Module not found",
             ApiError::StructFieldNotFound(_) => "Struct field not found",
@@ -195,6 +203,7 @@ impl ApiError {
             ApiError::TransactionParseError(inner) => inner,
             ApiError::InvalidOperations(inner) => inner,
             ApiError::InternalError(inner) => inner,
+            ApiError::CoinTypeFailedToBeFetched(inner) => inner,
             ApiError::AccountNotFound(inner) => inner,
             ApiError::ResourceNotFound(inner) => inner,
             ApiError::ModuleNotFound(inner) => inner,
@@ -211,6 +220,7 @@ impl ApiError {
             ApiError::VmError(inner) => inner,
             ApiError::MempoolIsFull(inner) => inner,
             ApiError::GasEstimationFailed(inner) => inner,
+            ApiError::MaxGasFeeTooLow(inner) => inner,
             _ => None,
         }
         .map(|details| ErrorDetails { details })

@@ -1,24 +1,25 @@
 // Copyright (c) Aptos
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::Arc;
-
 use crate::accept_type::AcceptType;
 use crate::accounts::Account;
 use crate::context::Context;
 use crate::failpoint::fail_point_poem;
 use crate::page::Page;
+use crate::response::BadRequestError;
 use crate::response::{
     BasicErrorWith404, BasicResponse, BasicResponseStatus, BasicResultWith404, InternalError,
 };
 use crate::ApiTags;
 use anyhow::Context as AnyhowContext;
 use aptos_api_types::{
-    Address, AptosErrorCode, EventKey, IdentifierWrapper, LedgerInfo, MoveStructTag, U64,
+    verify_field_identifier, Address, AptosErrorCode, AsConverter, IdentifierWrapper, LedgerInfo,
+    MoveStructTag, VerifyInputWithRecursion, VersionedEvent, U64,
 };
-use aptos_api_types::{AsConverter, VersionedEvent};
+use aptos_types::event::EventKey;
 use poem_openapi::param::Query;
 use poem_openapi::{param::Path, OpenApi};
+use std::sync::Arc;
 
 pub struct EventsApi {
     pub context: Arc<Context>,
@@ -26,51 +27,63 @@ pub struct EventsApi {
 
 #[OpenApi]
 impl EventsApi {
-    /// Get events by event key
+    /// Get events by creation number
     ///
-    /// This endpoint allows you to get a list of events of a specific type
-    /// as identified by its event key, which is a globally unique ID.
+    /// Event types are globally identifiable by an account `address` and
+    /// monotonically increasing `creation_number`, one per event type emitted
+    /// to the given account. This API returns events corresponding to that
+    /// that event type.
     #[oai(
-        path = "/events/:event_key",
+        path = "/accounts/:address/events/:creation_number",
         method = "get",
-        operation_id = "get_events_by_event_key",
+        operation_id = "get_events_by_creation_number",
         tag = "ApiTags::Events"
     )]
-    async fn get_events_by_event_key(
+    async fn get_events_by_creation_number(
         &self,
         accept_type: AcceptType,
-        // TODO: https://github.com/aptos-labs/aptos-core/issues/2278
-        /// Event key to retrieve events by
-        event_key: Path<EventKey>,
+        /// Hex-encoded 32 byte Aptos account, with or without a `0x` prefix, for
+        /// which events are queried. This refers to the account that events were
+        /// emitted to, not the account hosting the move module that emits that
+        /// event type.
+        address: Path<Address>,
+        /// Creation number corresponding to the event stream originating
+        /// from the given account.
+        creation_number: Path<U64>,
         /// Starting sequence number of events.
         ///
-        /// By default, will retrieve the most recent events
+        /// If unspecified, by default will retrieve the most recent events
         start: Query<Option<U64>>,
         /// Max number of events to retrieve.
         ///
-        /// Mo value defaults to default page size
+        /// If unspecified, defaults to default page size
         limit: Query<Option<u16>>,
     ) -> BasicResultWith404<Vec<VersionedEvent>> {
         fail_point_poem("endpoint_get_events_by_event_key")?;
         self.context
             .check_api_output_enabled("Get events by event key", &accept_type)?;
-        let page = Page::new(start.0.map(|v| v.0), limit.0);
+        let page = Page::new(
+            start.0.map(|v| v.0),
+            limit.0,
+            self.context.max_events_page_size(),
+        );
 
         // Ensure that account exists
-        let account = Account::new(
-            self.context.clone(),
-            event_key.0 .0.get_creator_address().into(),
-            None,
-        )?;
+        let account = Account::new(self.context.clone(), address.0, None)?;
         account.account_state()?;
-        self.list(account.latest_ledger_info, accept_type, page, event_key.0)
+        self.list(
+            account.latest_ledger_info,
+            accept_type,
+            page,
+            EventKey::new(creation_number.0 .0, address.0.into()),
+        )
     }
 
     /// Get events by event handle
     ///
-    /// This API extracts event key from the account resource identified
-    /// by the `event_handle_struct` and `field_name`, then returns
-    /// events identified by the event key.
+    /// This API uses the given account `address`, `eventHandle`, and `fieldName`
+    /// to build a key that can globally identify an event types. It then uses this
+    /// key to return events emitted to the given account matching that event type.
     #[oai(
         path = "/accounts/:address/events/:event_handle/:field_name",
         method = "get",
@@ -80,7 +93,10 @@ impl EventsApi {
     async fn get_events_by_event_handle(
         &self,
         accept_type: AcceptType,
-        /// Address of account with or without a `0x` prefix
+        /// Hex-encoded 32 byte Aptos account, with or without a `0x` prefix, for
+        /// which events are queried. This refers to the account that events were
+        /// emitted to, not the account hosting the move module that emits that
+        /// event type.
         address: Path<Address>,
         /// Name of struct to lookup event handle e.g. `0x1::account::Account`
         event_handle: Path<MoveStructTag>,
@@ -88,22 +104,35 @@ impl EventsApi {
         field_name: Path<IdentifierWrapper>,
         /// Starting sequence number of events.
         ///
-        /// By default, will retrieve the most recent events
+        /// If unspecified, by default will retrieve the most recent
         start: Query<Option<U64>>,
         /// Max number of events to retrieve.
         ///
-        /// Mo value defaults to default page size
+        /// If unspecified, defaults to default page size
         limit: Query<Option<u16>>,
     ) -> BasicResultWith404<Vec<VersionedEvent>> {
-        // TODO: Assert that Event represents u64s as strings.
+        event_handle
+            .0
+            .verify(0)
+            .context("'event_handle' invalid")
+            .map_err(|err| {
+                BasicErrorWith404::bad_request_with_code_no_info(err, AptosErrorCode::InvalidInput)
+            })?;
+        verify_field_identifier(field_name.as_str())
+            .context("'field_name' invalid")
+            .map_err(|err| {
+                BasicErrorWith404::bad_request_with_code_no_info(err, AptosErrorCode::InvalidInput)
+            })?;
         fail_point_poem("endpoint_get_events_by_event_handle")?;
         self.context
             .check_api_output_enabled("Get events by event handle", &accept_type)?;
-        let page = Page::new(start.0.map(|v| v.0), limit.0);
+        let page = Page::new(
+            start.0.map(|v| v.0),
+            limit.0,
+            self.context.max_events_page_size(),
+        );
         let account = Account::new(self.context.clone(), address.0, None)?;
-        let key = account
-            .find_event_key(event_handle.0, field_name.0.into())?
-            .into();
+        let key = account.find_event_key(event_handle.0, field_name.0.into())?;
         self.list(account.latest_ledger_info, accept_type, page, key)
     }
 }
@@ -121,7 +150,7 @@ impl EventsApi {
         let events = self
             .context
             .get_events(
-                &event_key.into(),
+                &event_key,
                 page.start_option(),
                 page.limit(&latest_ledger_info)?,
                 ledger_version,

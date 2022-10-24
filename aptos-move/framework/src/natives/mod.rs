@@ -18,11 +18,10 @@ use crate::natives::cryptography::multi_ed25519;
 use aggregator_natives::{aggregator, aggregator_factory};
 use cryptography::ed25519;
 use gas_algebra_ext::AbstractValueSize;
-use move_deps::{
-    move_core_types::{account_address::AccountAddress, identifier::Identifier},
-    move_vm_runtime::native_functions::{make_table_from_iter, NativeFunctionTable},
-    move_vm_types::values::Value,
-};
+
+use move_core_types::{account_address::AccountAddress, identifier::Identifier};
+use move_vm_runtime::native_functions::{make_table_from_iter, NativeFunctionTable};
+use move_vm_types::values::Value;
 
 pub mod status {
     // Failure in parsing a struct type tag
@@ -184,8 +183,9 @@ pub fn all_natives(
         };
     }
 
-    add_natives_from_module!("account", account::make_all(gas_params.account));
+    add_natives_from_module!("account", account::make_all(gas_params.account.clone()));
     add_natives_from_module!("ed25519", ed25519::make_all(gas_params.ed25519.clone()));
+    add_natives_from_module!("genesis", account::make_all(gas_params.account));
     add_natives_from_module!("multi_ed25519", multi_ed25519::make_all(gas_params.ed25519));
     add_natives_from_module!(
         "bls12381",

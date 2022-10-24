@@ -2,15 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    Address, AptosError, EntryFunctionId, EventKey, HashValue, HexEncodedBytes, MoveModuleBytecode,
-    MoveModuleId, MoveResource, MoveScriptBytecode, MoveStructTag, MoveType, MoveValue, U64,
+    Address, AptosError, EntryFunctionId, EventGuid, HashValue, HexEncodedBytes,
+    MoveModuleBytecode, MoveModuleId, MoveResource, MoveScriptBytecode, MoveStructTag, MoveType,
+    MoveValue, VerifyInput, VerifyInputWithRecursion, U64,
 };
-
 use anyhow::{bail, Context as AnyhowContext};
+use aptos_crypto::ed25519::{ED25519_PUBLIC_KEY_LENGTH, ED25519_SIGNATURE_LENGTH};
+use aptos_crypto::multi_ed25519::{BITMAP_NUM_OF_BYTES, MAX_NUM_OF_KEYS};
 use aptos_crypto::{
     ed25519::{self, Ed25519PublicKey},
     multi_ed25519::{self, MultiEd25519PublicKey},
 };
+use aptos_types::transaction::authenticator::MAX_NUM_OF_SIGS;
 use aptos_types::{
     account_address::AccountAddress,
     block_metadata::BlockMetadata,
@@ -20,7 +23,6 @@ use aptos_types::{
         Script, SignedTransaction, TransactionOutput, TransactionWithProof,
     },
 };
-
 use poem_openapi::{Object, Union};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -28,11 +30,15 @@ use std::{
     convert::{From, Into, TryFrom, TryInto},
     fmt,
     str::FromStr,
+    time::{SystemTime, UNIX_EPOCH},
 };
+
+// Warning: Do not add a docstring to a field that uses a type in `derives.rs`,
+// it will result in a change to the type representation. Read more about this
+// issue here: https://github.com/poem-web/poem/issues/385.
 
 // TODO: Add read_only / write_only (and their all variants) where appropriate.
 // TODO: Investigate the use of discriminator_name, see https://github.com/poem-web/poem/issues/329.
-// TODO: See https://github.com/poem-web/poem/issues/347 re mapping stuff. UPDATE: Wait for 2.0.7 to be released.
 
 /// Transaction data
 ///
@@ -320,6 +326,14 @@ pub struct TransactionInfo {
     pub accumulator_root_hash: HashValue,
     /// Final state of resources changed by the transaction
     pub changes: Vec<WriteSetChange>,
+    /// Block height that the transaction belongs in, this field will not be present through the API
+    #[oai(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_height: Option<U64>,
+    /// Epoch of the transaction belongs in, this field will not be present through the API
+    #[oai(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<U64>,
 }
 
 /// A transaction waiting in mempool
@@ -374,6 +388,13 @@ pub struct SubmitTransactionRequest {
     pub signature: TransactionSignature,
 }
 
+impl VerifyInput for SubmitTransactionRequest {
+    fn verify(&self) -> anyhow::Result<()> {
+        self.user_transaction_request.verify()?;
+        self.signature.verify()
+    }
+}
+
 /// Batch transaction submission result
 ///
 /// Tells which transactions failed
@@ -400,6 +421,21 @@ pub struct UserTransactionRequestInner {
     pub gas_unit_price: U64,
     pub expiration_timestamp_secs: U64,
     pub payload: TransactionPayload,
+}
+
+impl VerifyInput for UserTransactionRequestInner {
+    fn verify(&self) -> anyhow::Result<()> {
+        if let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) {
+            if self.expiration_timestamp_secs.0 <= now.as_secs() {
+                bail!(
+                    "Expiration time for transaction is in the past, {}",
+                    self.expiration_timestamp_secs.0
+                )
+            }
+        }
+
+        self.payload.verify()
+    }
 }
 
 // TODO: Remove this when we cut over.
@@ -435,6 +471,12 @@ pub struct EncodeSubmissionRequest {
     /// Secondary signer accounts of the request for Multi-agent
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secondary_signers: Option<Vec<Address>>,
+}
+
+impl VerifyInput for EncodeSubmissionRequest {
+    fn verify(&self) -> anyhow::Result<()> {
+        self.transaction.verify()
+    }
 }
 
 /// The genesis transaction
@@ -473,9 +515,11 @@ pub struct BlockMetadataTransaction {
 }
 
 /// An event from a transaction
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Object)]
+#[derive(Clone, Debug, Deserialize, Eq, Object, PartialEq, Serialize)]
 pub struct Event {
-    pub key: EventKey,
+    // The globally unique identifier of this event stream.
+    pub guid: EventGuid,
+    // The sequence number of the event
     pub sequence_number: U64,
     #[serde(rename = "type")]
     #[oai(rename = "type")]
@@ -488,7 +532,7 @@ impl From<(&ContractEvent, serde_json::Value)> for Event {
     fn from((event, data): (&ContractEvent, serde_json::Value)) -> Self {
         match event {
             ContractEvent::V0(v0) => Self {
-                key: (*v0.key()).into(),
+                guid: (*v0.key()).into(),
                 sequence_number: v0.sequence_number().into(),
                 typ: v0.type_tag().clone().into(),
                 data,
@@ -498,10 +542,12 @@ impl From<(&ContractEvent, serde_json::Value)> for Event {
 }
 
 /// An event from a transaction with a version
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Object)]
+#[derive(Clone, Debug, Deserialize, Eq, Object, PartialEq, Serialize)]
 pub struct VersionedEvent {
     pub version: U64,
-    pub key: EventKey,
+    // The globally unique identifier of this event stream.
+    pub guid: EventGuid,
+    // The sequence number of the event
     pub sequence_number: U64,
     #[serde(rename = "type")]
     #[oai(rename = "type")]
@@ -515,7 +561,7 @@ impl From<(&EventWithVersion, serde_json::Value)> for VersionedEvent {
         match &event.event {
             ContractEvent::V0(v0) => Self {
                 version: event.transaction_version.into(),
-                key: (*v0.key()).into(),
+                guid: (*v0.key()).into(),
                 sequence_number: v0.sequence_number().into(),
                 typ: v0.type_tag().clone().into(),
                 data,
@@ -542,9 +588,29 @@ pub enum TransactionPayload {
     ModuleBundlePayload(ModuleBundlePayload),
 }
 
+impl VerifyInput for TransactionPayload {
+    fn verify(&self) -> anyhow::Result<()> {
+        match self {
+            TransactionPayload::EntryFunctionPayload(inner) => inner.verify(),
+            TransactionPayload::ScriptPayload(inner) => inner.verify(),
+            TransactionPayload::ModuleBundlePayload(inner) => inner.verify(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Object)]
 pub struct ModuleBundlePayload {
     pub modules: Vec<MoveModuleBytecode>,
+}
+
+impl VerifyInput for ModuleBundlePayload {
+    fn verify(&self) -> anyhow::Result<()> {
+        for module in self.modules.iter() {
+            module.verify()?;
+        }
+
+        Ok(())
+    }
 }
 
 /// Payload which runs a single entry function
@@ -557,6 +623,16 @@ pub struct EntryFunctionPayload {
     pub arguments: Vec<serde_json::Value>,
 }
 
+impl VerifyInput for EntryFunctionPayload {
+    fn verify(&self) -> anyhow::Result<()> {
+        self.function.verify()?;
+        for type_arg in self.type_arguments.iter() {
+            type_arg.verify(0)?;
+        }
+        Ok(())
+    }
+}
+
 /// Payload which runs a script that can run multiple functions
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Object)]
 pub struct ScriptPayload {
@@ -565,6 +641,15 @@ pub struct ScriptPayload {
     pub type_arguments: Vec<MoveType>,
     /// Arguments of the function
     pub arguments: Vec<serde_json::Value>,
+}
+
+impl VerifyInput for ScriptPayload {
+    fn verify(&self) -> anyhow::Result<()> {
+        for type_arg in self.type_arguments.iter() {
+            type_arg.verify(0)?;
+        }
+        Ok(())
+    }
 }
 
 impl TryFrom<Script> for ScriptPayload {
@@ -729,6 +814,16 @@ pub enum TransactionSignature {
     MultiAgentSignature(MultiAgentSignature),
 }
 
+impl VerifyInput for TransactionSignature {
+    fn verify(&self) -> anyhow::Result<()> {
+        match self {
+            TransactionSignature::Ed25519Signature(inner) => inner.verify(),
+            TransactionSignature::MultiEd25519Signature(inner) => inner.verify(),
+            TransactionSignature::MultiAgentSignature(inner) => inner.verify(),
+        }
+    }
+}
+
 impl TryFrom<TransactionSignature> for TransactionAuthenticator {
     type Error = anyhow::Error;
     fn try_from(ts: TransactionSignature) -> anyhow::Result<Self> {
@@ -745,6 +840,25 @@ impl TryFrom<TransactionSignature> for TransactionAuthenticator {
 pub struct Ed25519Signature {
     pub public_key: HexEncodedBytes,
     pub signature: HexEncodedBytes,
+}
+
+impl VerifyInput for Ed25519Signature {
+    fn verify(&self) -> anyhow::Result<()> {
+        if self.public_key.inner().len() != ED25519_PUBLIC_KEY_LENGTH {
+            bail!(
+                "Ed25519 signature's public key is an invalid number of bytes, should be {} bytes",
+                ED25519_PUBLIC_KEY_LENGTH
+            )
+        } else if self.signature.inner().len() != ED25519_SIGNATURE_LENGTH {
+            bail!(
+                "Ed25519 signature length is an invalid number of bytes, should be {} bytes",
+                ED25519_SIGNATURE_LENGTH
+            )
+        } else {
+            // TODO: Check if they match / parse correctly?
+            Ok(())
+        }
+    }
 }
 
 impl TryFrom<Ed25519Signature> for TransactionAuthenticator {
@@ -801,6 +915,54 @@ pub struct MultiEd25519Signature {
     /// The number of signatures required for a successful transaction
     pub threshold: u8,
     pub bitmap: HexEncodedBytes,
+}
+
+impl VerifyInput for MultiEd25519Signature {
+    fn verify(&self) -> anyhow::Result<()> {
+        if self.public_keys.is_empty() {
+            bail!("MultiEd25519 signature has no public keys")
+        } else if self.signatures.is_empty() {
+            bail!("MultiEd25519 signature has no signatures")
+        } else if self.public_keys.len() > MAX_NUM_OF_KEYS {
+            bail!(
+                "MultiEd25519 signature has over the maximum number of public keys {}",
+                MAX_NUM_OF_KEYS
+            )
+        } else if self.signatures.len() > MAX_NUM_OF_SIGS {
+            bail!(
+                "MultiEd25519 signature has over the maximum number of signatures {}",
+                MAX_NUM_OF_SIGS
+            )
+        } else if self.public_keys.len() != self.signatures.len() {
+            bail!(
+                "MultiEd25519 signature does not have the same number of signatures as public keys"
+            )
+        } else if self.signatures.len() < self.threshold as usize {
+            bail!("MultiEd25519 signature does not have enough signatures to pass the threshold")
+        } else if self.threshold == 0 {
+            bail!("MultiEd25519 signature threshold must be greater than 0")
+        }
+        for signature in self.signatures.iter() {
+            if signature.inner().len() != ED25519_SIGNATURE_LENGTH {
+                bail!("MultiEd25519 signature has a signature with the wrong signature length")
+            }
+        }
+        for public_key in self.public_keys.iter() {
+            if public_key.inner().len() != ED25519_PUBLIC_KEY_LENGTH {
+                bail!("MultiEd25519 signature has a public key with the wrong public key length")
+            }
+        }
+
+        if self.bitmap.inner().len() != BITMAP_NUM_OF_BYTES {
+            bail!(
+                "MultiEd25519 signature has an invalid number of bitmap bytes {} expected {}",
+                self.bitmap.inner().len(),
+                BITMAP_NUM_OF_BYTES
+            );
+        }
+
+        Ok(())
+    }
 }
 
 impl TryFrom<MultiEd25519Signature> for TransactionAuthenticator {
@@ -877,6 +1039,15 @@ pub enum AccountSignature {
     MultiEd25519Signature(MultiEd25519Signature),
 }
 
+impl VerifyInput for AccountSignature {
+    fn verify(&self) -> anyhow::Result<()> {
+        match self {
+            AccountSignature::Ed25519Signature(inner) => inner.verify(),
+            AccountSignature::MultiEd25519Signature(inner) => inner.verify(),
+        }
+    }
+}
+
 impl TryFrom<AccountSignature> for AccountAuthenticator {
     type Error = anyhow::Error;
 
@@ -898,6 +1069,25 @@ pub struct MultiAgentSignature {
     pub secondary_signer_addresses: Vec<Address>,
     /// The associated signatures, in the same order as the secondary addresses
     pub secondary_signers: Vec<AccountSignature>,
+}
+
+impl VerifyInput for MultiAgentSignature {
+    fn verify(&self) -> anyhow::Result<()> {
+        self.sender.verify()?;
+
+        if self.secondary_signer_addresses.is_empty() {
+            bail!("MultiAgent signature has no secondary signer addresses")
+        } else if self.secondary_signers.is_empty() {
+            bail!("MultiAgent signature has no secondary signatures")
+        } else if self.secondary_signers.len() != self.secondary_signer_addresses.len() {
+            bail!("MultiAgent signatures don't match addresses length")
+        }
+
+        for signer in self.secondary_signers.iter() {
+            signer.verify()?;
+        }
+        Ok(())
+    }
 }
 
 impl TryFrom<MultiAgentSignature> for TransactionAuthenticator {
@@ -1071,7 +1261,18 @@ impl TransactionSigningMessage {
 
 /// Struct holding the outputs of the estimate gas API
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Object)]
-pub struct GasEstimation {
+pub struct GasEstimationBcs {
     /// The current estimate for the gas unit price
     pub gas_estimate: u64,
+}
+
+/// Struct holding the outputs of the estimate gas API
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Object)]
+pub struct GasEstimation {
+    /// The deprioritized estimate for the gas unit price
+    pub deprioritized_gas_estimate: Option<u64>,
+    /// The current estimate for the gas unit price
+    pub gas_estimate: u64,
+    /// The prioritized estimate for the gas unit price
+    pub prioritized_gas_estimate: Option<u64>,
 }

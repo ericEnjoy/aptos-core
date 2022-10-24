@@ -1,6 +1,7 @@
 // Copyright (c) Aptos
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::account::key_rotation::LookupAddress;
 use crate::account::{
     create::{CreateAccount, DEFAULT_FUNDED_COINS},
     fund::FundWithFaucet,
@@ -8,23 +9,26 @@ use crate::account::{
     list::{ListAccount, ListQuery},
     transfer::{TransferCoins, TransferSummary},
 };
-use crate::common::init::InitTool;
+use crate::common::init::{InitTool, Network};
 use crate::common::types::{
     account_address_from_public_key, AccountAddressWrapper, CliError, CliTypedResult,
     EncodingOptions, FaucetOptions, GasOptions, KeyType, MoveManifestAccountWrapper,
-    MovePackageDir, OptionalPoolAddressArgs, PrivateKeyInputOptions, PromptOptions, RestOptions,
-    RngArgs, SaveFile, TransactionOptions, TransactionSummary,
+    MovePackageDir, OptionalPoolAddressArgs, PrivateKeyInputOptions, PromptOptions,
+    PublicKeyInputOptions, RestOptions, RngArgs, SaveFile, TransactionOptions, TransactionSummary,
 };
+
+#[cfg(feature = "cli-framework-test-move")]
 use crate::common::utils::write_to_file;
+
 use crate::move_tool::{
-    ArgWithType, CompilePackage, DownloadPackage, IncludedArtifacts, InitPackage, MemberId,
-    PublishPackage, RunFunction, TestPackage,
+    ArgWithType, CompilePackage, DownloadPackage, FrameworkPackageArgs, IncludedArtifacts,
+    IncludedArtifactsArgs, InitPackage, MemberId, PublishPackage, RunFunction, TestPackage,
 };
 use crate::node::{
-    AnalyzeMode, AnalyzeValidatorPerformance, InitializeValidator, JoinValidatorSet,
+    AnalyzeMode, AnalyzeValidatorPerformance, GetStakePool, InitializeValidator, JoinValidatorSet,
     LeaveValidatorSet, OperatorArgs, OperatorConfigFileArgs, ShowValidatorConfig, ShowValidatorSet,
-    ShowValidatorStake, UpdateConsensusKey, UpdateValidatorNetworkAddresses,
-    ValidatorConsensusKeyArgs, ValidatorNetworkAddressesArgs,
+    ShowValidatorStake, StakePoolResult, UpdateConsensusKey, UpdateValidatorNetworkAddresses,
+    ValidatorConfig, ValidatorConsensusKeyArgs, ValidatorNetworkAddressesArgs,
 };
 use crate::op::key::{ExtractPeer, GenerateKey, NetworkKeyInputOptions, SaveKey};
 use crate::stake::{
@@ -33,21 +37,27 @@ use crate::stake::{
 };
 use crate::CliCommand;
 use aptos_config::config::Peer;
+use aptos_crypto::ed25519::Ed25519PublicKey;
 use aptos_crypto::{bls12381, ed25519::Ed25519PrivateKey, x25519, PrivateKey};
 use aptos_genesis::config::HostAndPort;
 use aptos_keygen::KeyGen;
 use aptos_logger::warn;
+use aptos_rest_client::aptos_api_types::{IdentifierWrapper, MoveStructTag};
 use aptos_rest_client::{aptos_api_types::MoveType, Transaction};
 use aptos_sdk::move_types::account_address::AccountAddress;
+use aptos_sdk::move_types::identifier::Identifier;
+use aptos_sdk::move_types::language_storage::ModuleId;
 use aptos_temppath::TempPath;
 use aptos_types::on_chain_config::ValidatorSet;
-use aptos_types::validator_config::ValidatorConfig;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::{collections::BTreeMap, path::PathBuf, str::FromStr, time::Duration};
+use std::{collections::BTreeMap, mem, path::PathBuf, str::FromStr, time::Duration};
+
+#[cfg(feature = "cli-framework-test-move")]
 use thiserror::private::PathAsDisplay;
+
 use tokio::time::{sleep, Instant};
 
 #[cfg(test)]
@@ -74,6 +84,7 @@ module NamedAddress0::store {
 
 /// A framework for testing the CLI
 pub struct CliTestFramework {
+    account_addresses: Vec<AccountAddress>,
     account_keys: Vec<Ed25519PrivateKey>,
     endpoint: Url,
     faucet_endpoint: Url,
@@ -84,6 +95,7 @@ impl CliTestFramework {
     pub fn local_new(num_accounts: usize) -> CliTestFramework {
         let dummy_url = Url::parse("http://localhost").unwrap();
         let mut framework = CliTestFramework {
+            account_addresses: Vec::new(),
             account_keys: Vec::new(),
             endpoint: dummy_url.clone(),
             faucet_endpoint: dummy_url,
@@ -91,15 +103,15 @@ impl CliTestFramework {
         };
         let mut keygen = KeyGen::from_seed([0; 32]);
         for _ in 0..num_accounts {
-            framework
-                .account_keys
-                .push(keygen.generate_ed25519_private_key());
+            let key = keygen.generate_ed25519_private_key();
+            framework.add_account_to_cli(key);
         }
         framework
     }
 
     pub async fn new(endpoint: Url, faucet_endpoint: Url, num_accounts: usize) -> CliTestFramework {
         let mut framework = CliTestFramework {
+            account_addresses: Vec::new(),
             account_keys: Vec::new(),
             endpoint,
             faucet_endpoint,
@@ -117,6 +129,10 @@ impl CliTestFramework {
         framework
     }
 
+    pub fn addresses(&self) -> Vec<AccountAddress> {
+        self.account_addresses.clone()
+    }
+
     async fn check_account_exists(&self, index: usize) -> bool {
         // Create account if it doesn't exist (and there's a faucet)
         let client = aptos_rest_client::Client::new(self.endpoint.clone());
@@ -125,6 +141,8 @@ impl CliTestFramework {
     }
 
     pub fn add_account_to_cli(&mut self, private_key: Ed25519PrivateKey) -> usize {
+        let address = account_address_from_public_key(&private_key.public_key());
+        self.account_addresses.push(address);
         self.account_keys.push(private_key);
         self.account_keys.len() - 1
     }
@@ -179,32 +197,47 @@ impl CliTestFramework {
         .await
     }
 
-    pub async fn rotate_key(
+    pub async fn lookup_address(
         &self,
+        public_key: &Ed25519PublicKey,
+    ) -> CliTypedResult<AccountAddress> {
+        LookupAddress {
+            public_key_options: PublicKeyInputOptions::from_key(public_key),
+            rest_options: self.rest_options(),
+            encoding_options: Default::default(),
+            profile_options: Default::default(),
+        }
+        .execute()
+        .await
+    }
+
+    pub async fn rotate_key(
+        &mut self,
         index: usize,
         new_private_key: String,
+        gas_options: Option<GasOptions>,
     ) -> CliTypedResult<RotateSummary> {
-        RotateKey {
+        let response = RotateKey {
             txn_options: TransactionOptions {
                 private_key_options: PrivateKeyInputOptions::from_private_key(
                     self.private_key(index),
                 )
                 .unwrap(),
+                sender_account: Some(self.account_id(index)),
                 rest_options: self.rest_options(),
-                gas_options: Default::default(),
-                prompt_options: PromptOptions {
-                    assume_yes: false,
-                    assume_no: true,
-                },
-                estimate_max_gas: true,
+                gas_options: gas_options.unwrap_or_default(),
+                prompt_options: PromptOptions::yes(),
                 ..Default::default()
             },
             new_private_key: Some(new_private_key),
             save_to_profile: None,
             new_private_key_file: None,
+            skip_saving_profile: true,
         }
         .execute()
-        .await
+        .await?;
+
+        Ok(response)
     }
 
     pub async fn list_account(&self, index: usize, query: ListQuery) -> CliTypedResult<Vec<Value>> {
@@ -239,11 +272,26 @@ impl CliTestFramework {
         sender_index: usize,
         amount: u64,
         gas_options: Option<GasOptions>,
-    ) -> CliTypedResult<TransferSummary> {
-        TransferCoins {
+    ) -> CliTypedResult<TransactionSummary> {
+        RunFunction {
+            function_id: MemberId {
+                module_id: ModuleId::new(
+                    AccountAddress::ONE,
+                    Identifier::from_str("coin").unwrap(),
+                ),
+                member_id: Identifier::from_str("transfer").unwrap(),
+            },
+            args: vec![
+                ArgWithType::from_str("address:0xdeadbeefcafebabe").unwrap(),
+                ArgWithType::from_str(&format!("u64:{}", amount)).unwrap(),
+            ],
+            type_args: vec![MoveType::Struct(MoveStructTag::new(
+                AccountAddress::ONE.into(),
+                IdentifierWrapper::from_str("aptos_coin").unwrap(),
+                IdentifierWrapper::from_str("AptosCoin").unwrap(),
+                vec![],
+            ))],
             txn_options: self.transaction_options(sender_index, gas_options),
-            account: AccountAddress::from_hex_literal(INVALID_ACCOUNT).unwrap(),
-            amount,
         }
         .execute()
         .await
@@ -311,9 +359,20 @@ impl CliTestFramework {
         .await
     }
 
-    pub async fn add_stake(&self, index: usize, amount: u64) -> CliTypedResult<TransactionSummary> {
+    pub async fn add_stake(
+        &self,
+        index: usize,
+        amount: u64,
+    ) -> CliTypedResult<Vec<TransactionSummary>> {
         AddStake {
-            txn_options: self.transaction_options(index, None),
+            txn_options: self.transaction_options(
+                index,
+                // TODO(greg): revisit after fixing gas estimation
+                Some(GasOptions {
+                    gas_unit_price: Some(1),
+                    max_gas: Some(10000),
+                }),
+            ),
             amount,
         }
         .execute()
@@ -324,7 +383,7 @@ impl CliTestFramework {
         &self,
         index: usize,
         amount: u64,
-    ) -> CliTypedResult<TransactionSummary> {
+    ) -> CliTypedResult<Vec<TransactionSummary>> {
         UnlockStake {
             txn_options: self.transaction_options(index, None),
             amount,
@@ -346,7 +405,7 @@ impl CliTestFramework {
         .await
     }
 
-    pub async fn increase_lockup(&self, index: usize) -> CliTypedResult<TransactionSummary> {
+    pub async fn increase_lockup(&self, index: usize) -> CliTypedResult<Vec<TransactionSummary>> {
         IncreaseLockup {
             txn_options: self.transaction_options(index, None),
         }
@@ -415,6 +474,7 @@ impl CliTestFramework {
             rest_options: self.rest_options(),
             profile_options: Default::default(),
             analyze_mode: AnalyzeMode::All,
+            pool_addresses: vec![],
         }
         .execute()
         .await
@@ -444,6 +504,7 @@ impl CliTestFramework {
 
     pub async fn init(&self, private_key: &Ed25519PrivateKey) -> CliTypedResult<()> {
         InitTool {
+            network: Some(Network::Custom),
             rest_url: Some(self.endpoint.clone()),
             faucet_url: Some(self.faucet_endpoint.clone()),
             rng_args: RngArgs::from_seed([0; 32]),
@@ -457,6 +518,19 @@ impl CliTestFramework {
         .await
     }
 
+    pub async fn get_pool_address(
+        &self,
+        owner_index: usize,
+    ) -> CliTypedResult<Vec<StakePoolResult>> {
+        GetStakePool {
+            owner_address: self.account_id(owner_index),
+            rest_options: self.rest_options(),
+            profile_options: Default::default(),
+        }
+        .execute()
+        .await
+    }
+
     pub async fn initialize_stake_owner(
         &self,
         owner_index: usize,
@@ -465,10 +539,42 @@ impl CliTestFramework {
         operator_index: Option<usize>,
     ) -> CliTypedResult<TransactionSummary> {
         InitializeStakeOwner {
-            txn_options: self.transaction_options(owner_index, None),
+            txn_options: self.transaction_options(
+                owner_index,
+                // TODO(greg): revisit after fixing gas estimation
+                Some(GasOptions {
+                    gas_unit_price: Some(1),
+                    max_gas: Some(100000),
+                }),
+            ),
             initial_stake_amount,
             operator_address: operator_index.map(|idx| self.account_id(idx)),
             voter_address: voter_index.map(|idx| self.account_id(idx)),
+        }
+        .execute()
+        .await
+    }
+
+    pub async fn create_stake_pool(
+        &self,
+        owner_index: usize,
+        operator_index: usize,
+        voter_index: usize,
+        amount: u64,
+        commission_percentage: u64,
+    ) -> CliTypedResult<TransactionSummary> {
+        RunFunction {
+            function_id: MemberId::from_str("0x1::staking_contract::create_staking_contract")
+                .unwrap(),
+            args: vec![
+                ArgWithType::address(self.account_id(operator_index)),
+                ArgWithType::address(self.account_id(voter_index)),
+                ArgWithType::u64(amount),
+                ArgWithType::u64(commission_percentage),
+                ArgWithType::bytes(vec![]),
+            ],
+            type_args: vec![],
+            txn_options: self.transaction_options(owner_index, None),
         }
         .execute()
         .await
@@ -478,7 +584,7 @@ impl CliTestFramework {
         &self,
         owner_index: usize,
         operator_index: usize,
-    ) -> CliTypedResult<TransactionSummary> {
+    ) -> CliTypedResult<Vec<TransactionSummary>> {
         SetOperator {
             txn_options: self.transaction_options(owner_index, None),
             operator_address: self.account_id(operator_index),
@@ -491,7 +597,7 @@ impl CliTestFramework {
         &self,
         owner_index: usize,
         voter_index: usize,
-    ) -> CliTypedResult<TransactionSummary> {
+    ) -> CliTypedResult<Vec<TransactionSummary>> {
         SetDelegatedVoter {
             txn_options: self.transaction_options(owner_index, None),
             voter_address: self.account_id(voter_index),
@@ -626,6 +732,7 @@ impl CliTestFramework {
         self.move_dir = Some(move_dir.path().to_path_buf());
     }
 
+    #[cfg(feature = "cli-framework-test-move")]
     pub fn add_move_files(&self) {
         let move_dir = self.move_dir();
         let sources_dir = move_dir.join("sources");
@@ -670,7 +777,10 @@ impl CliTestFramework {
                 assume_yes: false,
                 assume_no: true,
             },
-            for_test_framework: framework_dir,
+            framework_package_args: FrameworkPackageArgs {
+                framework_git_rev: None,
+                framework_local_dir: framework_dir,
+            },
         }
         .execute()
         .await
@@ -684,7 +794,9 @@ impl CliTestFramework {
         CompilePackage {
             move_options: self.move_options(account_strs),
             save_metadata: false,
-            included_artifacts: included_artifacts.unwrap_or(IncludedArtifacts::Sparse),
+            included_artifacts_args: IncludedArtifactsArgs {
+                included_artifacts: included_artifacts.unwrap_or(IncludedArtifacts::Sparse),
+            },
         }
         .execute()
         .await
@@ -709,15 +821,15 @@ impl CliTestFramework {
         index: usize,
         gas_options: Option<GasOptions>,
         account_strs: BTreeMap<&str, &str>,
-        legacy_flow: bool,
         included_artifacts: Option<IncludedArtifacts>,
     ) -> CliTypedResult<TransactionSummary> {
         PublishPackage {
             move_options: self.move_options(account_strs),
             txn_options: self.transaction_options(index, gas_options),
-            legacy_flow,
             override_size_check: false,
-            included_artifacts: included_artifacts.unwrap_or(IncludedArtifacts::All),
+            included_artifacts_args: IncludedArtifactsArgs {
+                included_artifacts: included_artifacts.unwrap_or(IncludedArtifacts::Sparse),
+            },
         }
         .execute()
         .await
@@ -811,7 +923,7 @@ impl CliTestFramework {
     }
 
     pub fn rest_options(&self) -> RestOptions {
-        RestOptions::new(Some(self.endpoint.clone()))
+        RestOptions::new(Some(self.endpoint.clone()), None)
     }
 
     pub fn faucet_options(&self) -> FaucetOptions {
@@ -826,10 +938,10 @@ impl CliTestFramework {
         TransactionOptions {
             private_key_options: PrivateKeyInputOptions::from_private_key(self.private_key(index))
                 .unwrap(),
+            sender_account: Some(self.account_id(index)),
             rest_options: self.rest_options(),
             gas_options: gas_options.unwrap_or_default(),
             prompt_options: PromptOptions::yes(),
-            estimate_max_gas: true,
             ..Default::default()
         }
     }
@@ -846,9 +958,17 @@ impl CliTestFramework {
         self.account_keys.get(index).unwrap()
     }
 
+    pub fn set_private_key(
+        &mut self,
+        index: usize,
+        new_key: Ed25519PrivateKey,
+    ) -> Ed25519PrivateKey {
+        // Insert the new private key into the test framework, returning the old one
+        mem::replace(&mut self.account_keys[index], new_key)
+    }
+
     pub fn account_id(&self, index: usize) -> AccountAddress {
-        let private_key = self.private_key(index);
-        account_address_from_public_key(&private_key.public_key())
+        *self.account_addresses.get(index).unwrap()
     }
 }
 

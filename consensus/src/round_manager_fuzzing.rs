@@ -16,9 +16,10 @@ use crate::{
     test_utils::{EmptyStateComputer, MockPayloadManager, MockStorage},
     util::{mock_time_service::SimulatedTimeService, time_service::TimeService},
 };
+use aptos_config::config::ConsensusConfig;
 use aptos_infallible::Mutex;
-use aptos_types::aggregate_signature::AggregateSignature;
 use aptos_types::{
+    aggregate_signature::AggregateSignature,
     epoch_change::EpochChangeProof,
     epoch_state::EpochState,
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
@@ -48,6 +49,8 @@ pub fn generate_corpus_proposal() -> Vec<u8> {
                 round: 1,
                 reason: NewRoundReason::QCReady,
                 timeout: std::time::Duration::new(5, 0),
+                prev_round_votes: Vec::new(),
+                prev_round_timeout_votes: None,
             })
             .await;
         // serialize and return proposal
@@ -156,6 +159,8 @@ fn create_node_for_fuzzing() -> RoundManager {
     // TODO: have two different nodes, one for proposing, one for accepting a proposal
     let proposer_election = Box::new(RotatingProposer::new(vec![signer.author()], 1));
 
+    let (round_manager_tx, _) = aptos_channel::new(QueueStyle::LIFO, 1, None);
+
     // event processor
     RoundManager::new(
         epoch_state,
@@ -169,8 +174,9 @@ fn create_node_for_fuzzing() -> RoundManager {
         ))),
         network,
         storage,
-        false,
         OnChainConsensusConfig::default(),
+        round_manager_tx,
+        ConsensusConfig::default(),
     )
 }
 

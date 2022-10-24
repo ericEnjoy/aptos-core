@@ -1,21 +1,18 @@
 // Copyright (c) Aptos
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::tests::common::setup_mempool_with_broadcast_buckets;
 use crate::{
-    core_mempool::{CoreMempool, MempoolTransaction, TimelineState, TtlCache},
-    tests::common::{
-        add_signed_txn, add_txn, add_txns_to_mempool, exist_in_metrics_cache, setup_mempool,
-        TestTransaction,
-    },
+    core_mempool::{CoreMempool, MempoolTransaction, TimelineState},
+    tests::common::{add_signed_txn, add_txn, add_txns_to_mempool, setup_mempool, TestTransaction},
 };
 use aptos_config::config::NodeConfig;
 use aptos_crypto::HashValue;
 use aptos_types::mempool_status::MempoolStatusCode;
 use aptos_types::{account_config::AccountSequenceInfo, transaction::SignedTransaction};
-use std::{
-    collections::HashSet,
-    time::{Duration, SystemTime},
-};
+use itertools::Itertools;
+use std::time::SystemTime;
+use std::{collections::HashSet, time::Duration};
 
 #[test]
 fn test_transaction_ordering_only_seqnos() {
@@ -68,15 +65,37 @@ fn test_transaction_ordering_only_seqnos() {
 }
 
 #[test]
-fn test_metric_cache_add_local_txns() {
+fn test_transaction_metrics() {
     let (mut mempool, _) = setup_mempool();
-    let txns = add_txns_to_mempool(
-        &mut mempool,
-        vec![TestTransaction::new(0, 0, 1), TestTransaction::new(1, 0, 2)],
+
+    let txn = TestTransaction::new(0, 0, 1).make_signed_transaction();
+    mempool.add_txn(
+        txn.clone(),
+        txn.gas_unit_price(),
+        AccountSequenceInfo::Sequential(0),
+        TimelineState::NotReady,
     );
-    // Check txns' timestamps exist in metrics_cache.
-    assert_eq!(exist_in_metrics_cache(&mempool, &txns[0]), true);
-    assert_eq!(exist_in_metrics_cache(&mempool, &txns[1]), true);
+    let txn = TestTransaction::new(1, 0, 2).make_signed_transaction();
+    mempool.add_txn(
+        txn.clone(),
+        txn.gas_unit_price(),
+        AccountSequenceInfo::Sequential(0),
+        TimelineState::NonQualified,
+    );
+
+    // Check timestamp returned as end-to-end for broadcast-able transaction
+    let (&_insertion_time, is_end_to_end, _bucket) = mempool
+        .get_transaction_store()
+        .get_insertion_time_and_bucket(&TestTransaction::get_address(0), 0)
+        .unwrap();
+    assert!(is_end_to_end);
+
+    // Check timestamp returned as not end-to-end for non-broadcast-able transaction
+    let (&_insertion_time, is_end_to_end, _bucket) = mempool
+        .get_transaction_store()
+        .get_insertion_time_and_bucket(&TestTransaction::get_address(1), 0)
+        .unwrap();
+    assert!(!is_end_to_end);
 }
 
 #[test]
@@ -142,7 +161,7 @@ fn test_update_invalid_transaction_in_mempool() {
 }
 
 #[test]
-fn test_remove_transaction() {
+fn test_commit_transaction() {
     let (mut pool, mut consensus) = setup_mempool();
 
     // Test normal flow.
@@ -151,7 +170,7 @@ fn test_remove_transaction() {
         vec![TestTransaction::new(0, 0, 1), TestTransaction::new(0, 1, 2)],
     );
     for txn in txns {
-        pool.remove_transaction(&txn.sender(), txn.sequence_number(), false);
+        pool.commit_transaction(&txn.sender(), txn.sequence_number());
     }
     let new_txns = add_txns_to_mempool(
         &mut pool,
@@ -166,6 +185,56 @@ fn test_remove_transaction() {
         consensus.get_block(&mut pool, 1, 1024),
         vec!(new_txns[1].clone())
     );
+}
+
+#[test]
+fn test_reject_transaction() {
+    let (mut pool, _) = setup_mempool();
+
+    let txns = add_txns_to_mempool(
+        &mut pool,
+        vec![TestTransaction::new(0, 0, 1), TestTransaction::new(0, 1, 2)],
+    );
+
+    // reject with wrong hash should have no effect
+    pool.reject_transaction(
+        &TestTransaction::get_address(0),
+        0,
+        &txns[1].clone().committed_hash(), // hash of other txn
+    );
+    assert!(pool
+        .get_transaction_store()
+        .get(&TestTransaction::get_address(0), 0)
+        .is_some());
+    pool.reject_transaction(
+        &TestTransaction::get_address(0),
+        1,
+        &txns[0].clone().committed_hash(), // hash of other txn
+    );
+    assert!(pool
+        .get_transaction_store()
+        .get(&TestTransaction::get_address(0), 1)
+        .is_some());
+
+    // reject with correct hash should have effect
+    pool.reject_transaction(
+        &TestTransaction::get_address(0),
+        0,
+        &txns[0].clone().committed_hash(),
+    );
+    assert!(pool
+        .get_transaction_store()
+        .get(&TestTransaction::get_address(0), 0)
+        .is_none());
+    pool.reject_transaction(
+        &TestTransaction::get_address(0),
+        1,
+        &txns[1].clone().committed_hash(),
+    );
+    assert!(pool
+        .get_transaction_store()
+        .get(&TestTransaction::get_address(0), 1)
+        .is_none());
 }
 
 #[test]
@@ -200,28 +269,20 @@ fn test_commit_callback() {
     // Check that pool is empty.
     assert!(pool.get_batch(1, 1024, HashSet::new()).is_empty());
     // Transaction 5 got back from consensus.
-    pool.remove_transaction(&TestTransaction::get_address(1), 5, false);
+    pool.commit_transaction(&TestTransaction::get_address(1), 5);
     // Verify that we can execute transaction 6.
     assert_eq!(pool.get_batch(1, 1024, HashSet::new())[0], txns[0]);
 }
 
 #[test]
-fn test_sequence_number_cache() {
-    // Checks potential race where StateDB is lagging.
-    let mut pool = setup_mempool().0;
-    // Callback from consensus should set current sequence number for account.
-    pool.remove_transaction(&TestTransaction::get_address(1), 5, false);
-
-    // Try to add transaction with sequence number 6 to pool (while last known executed transaction
-    // for AC is 0).
-    add_txns_to_mempool(&mut pool, vec![TestTransaction::new(1, 6, 1)]);
-    // Verify that we can execute transaction 6.
-    assert_eq!(pool.get_batch(1, 1024, HashSet::new()).len(), 1);
-}
-
-#[test]
 fn test_reset_sequence_number_on_failure() {
     let mut pool = setup_mempool().0;
+    let txns = vec![TestTransaction::new(1, 0, 1), TestTransaction::new(1, 1, 1)];
+    let hashes: Vec<_> = txns
+        .iter()
+        .cloned()
+        .map(|txn| txn.make_signed_transaction().committed_hash())
+        .collect();
     // Add two transactions for account.
     add_txns_to_mempool(
         &mut pool,
@@ -229,11 +290,18 @@ fn test_reset_sequence_number_on_failure() {
     );
 
     // Notify mempool about failure in arbitrary order
-    pool.remove_transaction(&TestTransaction::get_address(1), 0, true);
-    pool.remove_transaction(&TestTransaction::get_address(1), 1, true);
+    pool.reject_transaction(&TestTransaction::get_address(1), 0, &hashes[0]);
+    pool.reject_transaction(&TestTransaction::get_address(1), 1, &hashes[1]);
 
     // Verify that new transaction for this account can be added.
     assert!(add_txn(&mut pool, TestTransaction::new(1, 0, 1)).is_ok());
+}
+
+fn view(txns: Vec<SignedTransaction>) -> Vec<u64> {
+    txns.iter()
+        .map(SignedTransaction::sequence_number)
+        .sorted()
+        .collect()
 }
 
 #[test]
@@ -248,33 +316,152 @@ fn test_timeline() {
             TestTransaction::new(1, 5, 1),
         ],
     );
-    let view = |txns: Vec<SignedTransaction>| -> Vec<u64> {
-        txns.iter()
-            .map(SignedTransaction::sequence_number)
-            .collect()
-    };
-    let (timeline, _) = pool.read_timeline(0, 10);
+
+    let (timeline, _) = pool.read_timeline(&vec![0].into(), 10);
     assert_eq!(view(timeline), vec![0, 1]);
     // Txns 3 and 5 should be in parking lot.
     assert_eq!(2, pool.get_parking_lot_size());
 
     // Add txn 2 to unblock txn3.
     add_txns_to_mempool(&mut pool, vec![TestTransaction::new(1, 2, 1)]);
-    let (timeline, _) = pool.read_timeline(0, 10);
+    let (timeline, _) = pool.read_timeline(&vec![0].into(), 10);
     assert_eq!(view(timeline), vec![0, 1, 2, 3]);
     // Txn 5 should be in parking lot.
     assert_eq!(1, pool.get_parking_lot_size());
 
     // Try different start read position.
-    let (timeline, _) = pool.read_timeline(2, 10);
+    let (timeline, _) = pool.read_timeline(&vec![2].into(), 10);
     assert_eq!(view(timeline), vec![2, 3]);
 
     // Simulate callback from consensus to unblock txn 5.
-    pool.remove_transaction(&TestTransaction::get_address(1), 4, false);
-    let (timeline, _) = pool.read_timeline(0, 10);
+    pool.commit_transaction(&TestTransaction::get_address(1), 4);
+    let (timeline, _) = pool.read_timeline(&vec![0].into(), 10);
     assert_eq!(view(timeline), vec![5]);
     // check parking lot is empty
     assert_eq!(0, pool.get_parking_lot_size());
+}
+
+#[test]
+fn test_multi_bucket_timeline() {
+    let mut pool = setup_mempool_with_broadcast_buckets(vec![0, 101, 201]).0;
+    add_txns_to_mempool(
+        &mut pool,
+        vec![
+            TestTransaction::new(1, 0, 1),   // bucket 0
+            TestTransaction::new(1, 1, 100), // bucket 0
+            TestTransaction::new(1, 3, 200), // bucket 1
+            TestTransaction::new(1, 5, 300), // bucket 2
+        ],
+    );
+
+    let (timeline, _) = pool.read_timeline(&vec![0, 0, 0].into(), 10);
+    assert_eq!(view(timeline), vec![0, 1]);
+    // Txns 3 and 5 should be in parking lot.
+    assert_eq!(2, pool.get_parking_lot_size());
+
+    // Add txn 2 to unblock txn3.
+    add_txns_to_mempool(&mut pool, vec![TestTransaction::new(1, 2, 1)]);
+    let (timeline, _) = pool.read_timeline(&vec![0, 0, 0].into(), 10);
+    assert_eq!(view(timeline), vec![0, 1, 2, 3]);
+    // Txn 5 should be in parking lot.
+    assert_eq!(1, pool.get_parking_lot_size());
+
+    // Try different start read positions. Expected buckets: [[0, 1, 2], [3], []]
+    let (timeline, _) = pool.read_timeline(&vec![1, 0, 0].into(), 10);
+    assert_eq!(view(timeline), vec![1, 2, 3]);
+    let (timeline, _) = pool.read_timeline(&vec![2, 0, 0].into(), 10);
+    assert_eq!(view(timeline), vec![2, 3]);
+    let (timeline, _) = pool.read_timeline(&vec![0, 1, 0].into(), 10);
+    assert_eq!(view(timeline), vec![0, 1, 2]);
+    let (timeline, _) = pool.read_timeline(&vec![1, 1, 0].into(), 10);
+    assert_eq!(view(timeline), vec![1, 2]);
+    let (timeline, _) = pool.read_timeline(&vec![2, 1, 0].into(), 10);
+    assert_eq!(view(timeline), vec![2]);
+    let (timeline, _) = pool.read_timeline(&vec![3, 0, 0].into(), 10);
+    assert_eq!(view(timeline), vec![3]);
+    let (timeline, _) = pool.read_timeline(&vec![3, 1, 0].into(), 10);
+    assert!(view(timeline).is_empty());
+
+    // Ensure high gas is prioritized.
+    let (timeline, _) = pool.read_timeline(&vec![0, 0, 0].into(), 1);
+    assert_eq!(view(timeline), vec![3]);
+
+    // Simulate callback from consensus to unblock txn 5.
+    pool.commit_transaction(&TestTransaction::get_address(1), 4);
+    let (timeline, _) = pool.read_timeline(&vec![0, 0, 0].into(), 10);
+    assert_eq!(view(timeline), vec![5]);
+    // check parking lot is empty
+    assert_eq!(0, pool.get_parking_lot_size());
+}
+
+#[test]
+fn test_multi_bucket_gas_ranking_update() {
+    let mut pool = setup_mempool_with_broadcast_buckets(vec![0, 101, 201]).0;
+    add_txns_to_mempool(
+        &mut pool,
+        vec![
+            TestTransaction::new(1, 0, 1),   // bucket 0
+            TestTransaction::new(1, 1, 100), // bucket 0
+            TestTransaction::new(1, 2, 101), // bucket 1
+            TestTransaction::new(1, 3, 200), // bucket 1
+        ],
+    );
+
+    // txn 2 and 3 are prioritized
+    let (timeline, _) = pool.read_timeline(&vec![0, 0, 0].into(), 2);
+    assert_eq!(view(timeline), vec![2, 3]);
+    // read only bucket 2
+    let (timeline, _) = pool.read_timeline(&vec![10, 10, 0].into(), 10);
+    assert!(view(timeline).is_empty());
+
+    // resubmit with higher gas: move txn 2 to bucket 2
+    add_txns_to_mempool(&mut pool, vec![TestTransaction::new(1, 2, 400)]);
+
+    // txn 2 is now prioritized
+    let (timeline, _) = pool.read_timeline(&vec![0, 0, 0].into(), 1);
+    assert_eq!(view(timeline), vec![2]);
+    // then txn 3 is prioritized
+    let (timeline, _) = pool.read_timeline(&vec![0, 0, 0].into(), 2);
+    assert_eq!(view(timeline), vec![2, 3]);
+    // read only bucket 2
+    let (timeline, _) = pool.read_timeline(&vec![10, 10, 0].into(), 10);
+    assert_eq!(view(timeline), vec![2]);
+    // read only bucket 1
+    let (timeline, _) = pool.read_timeline(&vec![10, 0, 10].into(), 10);
+    assert_eq!(view(timeline), vec![3]);
+}
+
+#[test]
+fn test_multi_bucket_removal() {
+    let mut pool = setup_mempool_with_broadcast_buckets(vec![0, 101, 201]).0;
+    add_txns_to_mempool(
+        &mut pool,
+        vec![
+            TestTransaction::new(1, 0, 1),   // bucket 0
+            TestTransaction::new(1, 1, 100), // bucket 0
+            TestTransaction::new(1, 2, 300), // bucket 2
+            TestTransaction::new(1, 3, 200), // bucket 1
+        ],
+    );
+
+    let (timeline, _) = pool.read_timeline(&vec![0, 0, 0].into(), 10);
+    assert_eq!(view(timeline), vec![0, 1, 2, 3]);
+
+    pool.commit_transaction(&TestTransaction::get_address(1), 0);
+    let (timeline, _) = pool.read_timeline(&vec![0, 0, 0].into(), 10);
+    assert_eq!(view(timeline), vec![1, 2, 3]);
+
+    pool.commit_transaction(&TestTransaction::get_address(1), 1);
+    let (timeline, _) = pool.read_timeline(&vec![0, 0, 0].into(), 10);
+    assert_eq!(view(timeline), vec![2, 3]);
+
+    pool.commit_transaction(&TestTransaction::get_address(1), 2);
+    let (timeline, _) = pool.read_timeline(&vec![0, 0, 0].into(), 10);
+    assert_eq!(view(timeline), vec![3]);
+
+    pool.commit_transaction(&TestTransaction::get_address(1), 3);
+    let (timeline, _) = pool.read_timeline(&vec![0, 0, 0].into(), 10);
+    assert!(view(timeline).is_empty());
 }
 
 #[test]
@@ -289,7 +476,7 @@ fn test_capacity() {
     assert!(add_txn(&mut pool, TestTransaction::new(1, 1, 1)).is_err());
 
     // Commit transaction and free space.
-    pool.remove_transaction(&TestTransaction::get_address(1), 0, false);
+    pool.commit_transaction(&TestTransaction::get_address(1), 0);
     assert!(add_txn(&mut pool, TestTransaction::new(1, 1, 1)).is_ok());
 
     // Fill it up and check that GC routine will clear space.
@@ -366,6 +553,7 @@ fn new_test_mempool_transaction(address: usize, sequence_number: u64) -> Mempool
         1,
         TimelineState::NotReady,
         AccountSequenceInfo::Sequential(0),
+        SystemTime::now(),
     )
 }
 
@@ -447,7 +635,7 @@ fn test_gc_ready_transaction() {
     add_txn(&mut pool, TestTransaction::new(1, 3, 1)).unwrap();
 
     // Check that all txns are ready.
-    let (timeline, _) = pool.read_timeline(0, 10);
+    let (timeline, _) = pool.read_timeline(&vec![0].into(), 10);
     assert_eq!(timeline.len(), 4);
 
     // GC expired transaction.
@@ -458,7 +646,7 @@ fn test_gc_ready_transaction() {
     assert_eq!(block.len(), 1);
     assert_eq!(block[0].sequence_number(), 0);
 
-    let (timeline, _) = pool.read_timeline(0, 10);
+    let (timeline, _) = pool.read_timeline(&vec![0].into(), 10);
     assert_eq!(timeline.len(), 1);
     assert_eq!(timeline[0].sequence_number(), 0);
 
@@ -466,7 +654,7 @@ fn test_gc_ready_transaction() {
     add_txn(&mut pool, TestTransaction::new(1, 1, 1)).unwrap();
 
     // Make sure txns 2 and 3 can be broadcast after txn 1 is resubmitted
-    let (timeline, _) = pool.read_timeline(0, 10);
+    let (timeline, _) = pool.read_timeline(&vec![0].into(), 10);
     assert_eq!(timeline.len(), 4);
 }
 
@@ -487,30 +675,6 @@ fn test_clean_stuck_transactions() {
     let block = pool.get_batch(1, 1024, HashSet::new());
     assert_eq!(block.len(), 1);
     assert_eq!(block[0].sequence_number(), 10);
-}
-
-#[test]
-fn test_ttl_cache() {
-    let mut cache = TtlCache::new(2, Duration::from_secs(1));
-    // Test basic insertion.
-    cache.insert(1, 1);
-    cache.insert(1, 2);
-    cache.insert(2, 2);
-    cache.insert(1, 3);
-    assert_eq!(cache.get(&1), Some(&3));
-    assert_eq!(cache.get(&2), Some(&2));
-    assert_eq!(cache.size(), 2);
-    // Test reaching max capacity.
-    cache.insert(3, 3);
-    assert_eq!(cache.size(), 2);
-    assert_eq!(cache.get(&1), Some(&3));
-    assert_eq!(cache.get(&3), Some(&3));
-    assert_eq!(cache.get(&2), None);
-    // Test ttl functionality.
-    cache.gc(SystemTime::now()
-        .checked_add(Duration::from_secs(10))
-        .unwrap());
-    assert_eq!(cache.size(), 0);
 }
 
 #[test]
@@ -577,4 +741,47 @@ fn test_bytes_limit() {
     let limit = 10;
     let hit_limit = pool.get_batch(100, txn_size * limit, HashSet::new());
     assert_eq!(hit_limit.len(), limit as usize);
+}
+
+#[test]
+fn test_transaction_store_remove_account_if_empty() {
+    let mut config = NodeConfig::random();
+    config.mempool.capacity = 100;
+    let mut pool = CoreMempool::new(&config);
+
+    assert_eq!(pool.get_transaction_store().get_transactions().len(), 0);
+
+    add_txn(&mut pool, TestTransaction::new(1, 0, 1)).unwrap();
+    add_txn(&mut pool, TestTransaction::new(1, 1, 1)).unwrap();
+    add_txn(&mut pool, TestTransaction::new(2, 0, 1)).unwrap();
+    assert_eq!(pool.get_transaction_store().get_transactions().len(), 2);
+
+    pool.commit_transaction(&TestTransaction::get_address(1), 0);
+    pool.commit_transaction(&TestTransaction::get_address(1), 1);
+    pool.commit_transaction(&TestTransaction::get_address(2), 0);
+    assert_eq!(pool.get_transaction_store().get_transactions().len(), 0);
+
+    let txn = TestTransaction::new(2, 2, 1).make_signed_transaction();
+    let hash = txn.clone().committed_hash();
+    add_signed_txn(&mut pool, txn).unwrap();
+    assert_eq!(pool.get_transaction_store().get_transactions().len(), 1);
+
+    pool.reject_transaction(&TestTransaction::get_address(2), 2, &hash);
+    assert_eq!(pool.get_transaction_store().get_transactions().len(), 0);
+}
+
+#[test]
+fn test_sequence_number_behavior_at_capacity() {
+    let mut config = NodeConfig::random();
+    config.mempool.capacity = 2;
+    let mut pool = CoreMempool::new(&config);
+
+    add_txn(&mut pool, TestTransaction::new(0, 0, 1)).unwrap();
+    add_txn(&mut pool, TestTransaction::new(1, 0, 1)).unwrap();
+    pool.commit_transaction(&TestTransaction::get_address(1), 0);
+    add_txn(&mut pool, TestTransaction::new(2, 0, 1)).unwrap();
+    pool.commit_transaction(&TestTransaction::get_address(2), 0);
+
+    let batch = pool.get_batch(10, 10240, HashSet::new());
+    assert_eq!(batch.len(), 1);
 }

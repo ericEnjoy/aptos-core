@@ -70,10 +70,7 @@ where
         let fut = async move {
             match handler(request, options).await {
                 Ok(response) => {
-                    debug!(
-                        "Response: {}",
-                        serde_json::to_string_pretty(&response).unwrap()
-                    );
+                    debug!("Response: {:?}", serde_json::to_string_pretty(&response));
                     Ok(warp::reply::with_status(
                         warp::reply::json(&response),
                         warp::http::StatusCode::OK,
@@ -151,12 +148,12 @@ pub fn native_coin() -> Currency {
 }
 
 pub fn native_coin_tag() -> TypeTag {
-    TypeTag::Struct(StructTag {
+    TypeTag::Struct(Box::new(StructTag {
         address: AccountAddress::ONE,
         module: ident_str!(APTOS_COIN_MODULE).into(),
         name: ident_str!(APTOS_COIN_RESOURCE).into(),
         type_params: vec![],
-    })
+    }))
 }
 
 pub fn is_native_coin(currency: &Currency) -> ApiResult<()> {

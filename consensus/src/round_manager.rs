@@ -23,6 +23,7 @@ use crate::{
     persistent_liveness_storage::PersistentLivenessStorage,
 };
 use anyhow::{bail, ensure, Context, Result};
+use aptos_config::config::ConsensusConfig;
 use aptos_infallible::{checked, Mutex};
 use aptos_logger::prelude::*;
 use aptos_types::{
@@ -47,7 +48,12 @@ use futures::{channel::oneshot, FutureExt, StreamExt};
 use safety_rules::ConsensusState;
 use safety_rules::TSafetyRules;
 use serde::Serialize;
-use std::{mem::Discriminant, sync::Arc, time::Duration};
+use std::{
+    mem::{discriminant, Discriminant},
+    sync::Arc,
+    time::Duration,
+};
+use tokio::time::{sleep, Instant};
 
 #[derive(Serialize, Clone)]
 pub enum UnverifiedEvent {
@@ -57,6 +63,8 @@ pub enum UnverifiedEvent {
     CommitVote(Box<CommitVote>),
     CommitDecision(Box<CommitDecision>),
 }
+
+pub const BACK_PRESSURE_POLLING_INTERVAL_MS: u64 = 10;
 
 impl UnverifiedEvent {
     pub fn verify(self, validator: &ValidatorVerifier) -> Result<VerifiedEvent, VerifyError> {
@@ -110,6 +118,7 @@ impl From<ConsensusMsg> for UnverifiedEvent {
 pub enum VerifiedEvent {
     // network messages
     ProposalMsg(Box<ProposalMsg>),
+    VerifiedProposalMsg(Box<Block>),
     VoteMsg(Box<VoteMsg>),
     UnverifiedSyncInfo(Box<SyncInfo>),
     CommitVote(Box<CommitVote>),
@@ -140,8 +149,10 @@ pub struct RoundManager {
     safety_rules: Arc<Mutex<MetricsSafetyRules>>,
     network: NetworkSender,
     storage: Arc<dyn PersistentLivenessStorage>,
-    sync_only: bool,
     onchain_config: OnChainConsensusConfig,
+    round_manager_tx:
+        aptos_channel::Sender<(Author, Discriminant<VerifiedEvent>), (Author, VerifiedEvent)>,
+    local_config: ConsensusConfig,
 }
 
 impl RoundManager {
@@ -154,14 +165,18 @@ impl RoundManager {
         safety_rules: Arc<Mutex<MetricsSafetyRules>>,
         network: NetworkSender,
         storage: Arc<dyn PersistentLivenessStorage>,
-        sync_only: bool,
         onchain_config: OnChainConsensusConfig,
+        round_manager_tx: aptos_channel::Sender<
+            (Author, Discriminant<VerifiedEvent>),
+            (Author, VerifiedEvent),
+        >,
+        local_config: ConsensusConfig,
     ) -> Self {
         // when decoupled execution is false,
         // the counter is still static.
         counters::OP_COUNTERS
             .gauge("sync_only")
-            .set(sync_only as i64);
+            .set(local_config.sync_only as i64);
         counters::OP_COUNTERS
             .gauge("decoupled_execution")
             .set(onchain_config.decoupled_execution() as i64);
@@ -174,17 +189,14 @@ impl RoundManager {
             safety_rules,
             network,
             storage,
-            sync_only,
             onchain_config,
+            round_manager_tx,
+            local_config,
         }
     }
 
     fn decoupled_execution(&self) -> bool {
         self.onchain_config.decoupled_execution()
-    }
-
-    fn back_pressure_limit(&self) -> u64 {
-        self.onchain_config.back_pressure_limit()
     }
 
     // TODO: Evaluate if creating a block retriever is slow and cache this if needed.
@@ -229,10 +241,12 @@ impl RoundManager {
             self.new_log(LogEvent::NewRound),
             reason = new_round_event.reason
         );
+
         if self
             .proposer_election
             .is_valid_proposer(self.proposal_generator.author(), new_round_event.round)
         {
+            self.log_collected_vote_stats(&new_round_event);
             self.round_state.setup_leader_timeout();
             let proposal_msg = self.generate_proposal(new_round_event).await?;
             let mut network = self.network.clone();
@@ -247,6 +261,75 @@ impl RoundManager {
             counters::PROPOSALS_COUNT.inc();
         }
         Ok(())
+    }
+
+    fn log_collected_vote_stats(&self, new_round_event: &NewRoundEvent) {
+        let prev_round_votes_for_li = new_round_event
+            .prev_round_votes
+            .iter()
+            .map(|(_, li_with_sig)| {
+                let (voting_power, votes): (Vec<_>, Vec<_>) = li_with_sig
+                    .signatures()
+                    .keys()
+                    .map(|author| {
+                        self.epoch_state
+                            .verifier
+                            .get_voting_power(author)
+                            .map(|voting_power| (voting_power as u128, 1))
+                            .unwrap_or((0u128, 0))
+                    })
+                    .unzip();
+                (voting_power.iter().sum(), votes.iter().sum())
+            })
+            .collect::<Vec<(u128, usize)>>();
+
+        let (max_voting_power, max_num_votes) = prev_round_votes_for_li
+            .iter()
+            .max()
+            .cloned()
+            .unwrap_or((0, 0));
+
+        let (voting_powers, votes_counts): (Vec<_>, Vec<_>) =
+            prev_round_votes_for_li.iter().cloned().unzip();
+        let conflicting_voting_power = voting_powers.into_iter().sum::<u128>() - max_voting_power;
+        let conflicting_num_votes = votes_counts.into_iter().sum::<usize>() - max_num_votes;
+
+        let (timeout_voting_power, timeout_num_votes) = new_round_event
+            .prev_round_timeout_votes
+            .as_ref()
+            .map(|timeout_votes| {
+                let (voting_power, votes): (Vec<_>, Vec<_>) = timeout_votes
+                    .signers()
+                    .map(|author| {
+                        self.epoch_state
+                            .verifier
+                            .get_voting_power(author)
+                            .map(|voting_power| (voting_power as u128, 1))
+                            .unwrap_or((0u128, 0))
+                    })
+                    .unzip();
+                (voting_power.iter().sum(), votes.iter().sum())
+            })
+            .unwrap_or((0, 0));
+
+        counters::PROPOSER_COLLECTED_ROUND_COUNT.inc();
+        counters::PROPOSER_COLLECTED_MOST_VOTING_POWER.inc_by(max_voting_power as f64);
+        counters::PROPOSER_COLLECTED_CONFLICTING_VOTING_POWER
+            .inc_by(conflicting_voting_power as f64);
+        counters::PROPOSER_COLLECTED_TIMEOUT_VOTING_POWER.inc_by(timeout_voting_power as f64);
+
+        info!(
+            epoch = self.epoch_state.epoch,
+            round = new_round_event.round,
+            total_voting_power = ?self.epoch_state.verifier.total_voting_power(),
+            max_voting_power = ?max_voting_power,
+            max_num_votes = max_num_votes,
+            conflicting_voting_power = ?conflicting_voting_power,
+            conflicting_num_votes = conflicting_num_votes,
+            timeout_voting_power = ?timeout_voting_power,
+            timeout_num_votes = timeout_num_votes,
+            "Preparing new proposal",
+        );
     }
 
     async fn generate_proposal(
@@ -286,7 +369,7 @@ impl RoundManager {
 
         observe_block(
             proposal_msg.proposal().timestamp_usecs(),
-            BlockStage::RECEIVED,
+            BlockStage::ROUND_MANAGER_RECEIVED,
         );
         info!(
             self.new_log(LogEvent::ReceiveProposal)
@@ -312,6 +395,18 @@ impl RoundManager {
                 self.round_state.current_round()
             );
         }
+    }
+
+    pub async fn process_delayed_proposal_msg(&mut self, proposal: Block) -> Result<()> {
+        if proposal.round() != self.round_state.current_round() {
+            bail!(
+                "Discarding stale delayed proposal {}, current round {}",
+                proposal,
+                self.round_state.current_round()
+            );
+        }
+
+        self.process_verified_proposal(proposal).await
     }
 
     /// Sync to the sync info sending from peer if it has newer certificates.
@@ -394,22 +489,14 @@ impl RoundManager {
 
     fn sync_only(&self) -> bool {
         if self.decoupled_execution() {
-            let commit_round = self.block_store.commit_root().round();
-            let ordered_round = self.block_store.ordered_root().round();
-            let sync_or_not =
-                self.sync_only || ordered_round > self.back_pressure_limit() + commit_round;
-
+            let sync_or_not = self.local_config.sync_only || self.block_store.back_pressure();
             counters::OP_COUNTERS
                 .gauge("sync_only")
                 .set(sync_or_not as i64);
 
-            counters::OP_COUNTERS
-                .gauge("back_pressure")
-                .set((ordered_round - commit_round) as i64);
-
             sync_or_not
         } else {
-            self.sync_only
+            self.local_config.sync_only
         }
     }
 
@@ -498,6 +585,22 @@ impl RoundManager {
             .author()
             .expect("Proposal should be verified having an author");
 
+        let payload_len = proposal.payload().map_or(0, |payload| payload.len());
+        let payload_size = proposal.payload().map_or(0, |payload| payload.size());
+        ensure!(
+            payload_len as u64 <= self.local_config.max_receiving_block_txns,
+            "Payload len {} exceeds the limit {}",
+            payload_len,
+            self.local_config.max_receiving_block_txns,
+        );
+
+        ensure!(
+            payload_size as u64 <= self.local_config.max_receiving_block_bytes,
+            "Payload size {} exceeds the limit {}",
+            payload_size,
+            self.local_config.max_receiving_block_bytes,
+        );
+
         ensure!(
             self.proposer_election.is_valid_proposal(&proposal),
             "[RoundManager] Proposer {} for block {} is not a valid proposer for this round or created duplicate proposal",
@@ -531,7 +634,48 @@ impl RoundManager {
         );
 
         observe_block(proposal.timestamp_usecs(), BlockStage::SYNCED);
+        if self.decoupled_execution() && self.block_store.back_pressure() {
+            // In case of back pressure, we delay processing proposal. This is done by resending the
+            // same proposal to self after some time.
+            Ok(self
+                .resend_verified_proposal_to_self(
+                    proposal,
+                    BACK_PRESSURE_POLLING_INTERVAL_MS,
+                    self.local_config.round_initial_timeout_ms,
+                )
+                .await)
+        } else {
+            self.process_verified_proposal(proposal).await
+        }
+    }
 
+    async fn resend_verified_proposal_to_self(
+        &self,
+        proposal: Block,
+        polling_interval_ms: u64,
+        timeout_ms: u64,
+    ) {
+        let start = Instant::now();
+        let author = self.network.author();
+        let block_store = self.block_store.clone();
+        let self_sender = self.round_manager_tx.clone();
+        let event = VerifiedEvent::VerifiedProposalMsg(Box::new(proposal));
+        tokio::spawn(async move {
+            while start.elapsed() < Duration::from_millis(timeout_ms) {
+                if !block_store.back_pressure() {
+                    if let Err(e) =
+                        self_sender.push((author, discriminant(&event)), (author, event))
+                    {
+                        error!("Failed to send event to round manager {:?}", e);
+                    }
+                    break;
+                }
+                sleep(Duration::from_millis(polling_interval_ms)).await;
+            }
+        });
+    }
+
+    pub async fn process_verified_proposal(&mut self, proposal: Block) -> Result<()> {
         let proposal_round = proposal.round();
         let vote = self
             .execute_and_vote(proposal)
@@ -682,7 +826,10 @@ impl RoundManager {
             VoteReceptionResult::EchoTimeout(_) if !self.round_state.is_vote_timeout() => {
                 self.process_local_timeout(round).await
             }
-            _ => Ok(()),
+            VoteReceptionResult::VoteAdded(_)
+            | VoteReceptionResult::EchoTimeout(_)
+            | VoteReceptionResult::DuplicateVote => Ok(()),
+            e => Err(anyhow::anyhow!("{:?}", e)),
         }
     }
 
@@ -770,6 +917,12 @@ impl RoundManager {
                             monitor!(
                                 "process_proposal",
                                 self.process_proposal_msg(*proposal_msg).await
+                            )
+                        }
+                        VerifiedEvent::VerifiedProposalMsg(proposal_msg) => {
+                            monitor!(
+                                "process_verified_proposal",
+                                self.process_delayed_proposal_msg(*proposal_msg).await
                             )
                         }
                         VerifiedEvent::VoteMsg(vote_msg) => {

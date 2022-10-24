@@ -21,22 +21,20 @@ use crate::{
     },
     util::time_service::{ClockTimeService, TimeService},
 };
-use aptos_config::network_id::NetworkId;
+use aptos_config::{config::ConsensusConfig, network_id::NetworkId};
 use aptos_crypto::HashValue;
 use aptos_infallible::Mutex;
 use aptos_secure_storage::Storage;
-use aptos_types::validator_verifier::generate_validator_verifier;
 use aptos_types::{
     epoch_state::EpochState,
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
     on_chain_config::OnChainConsensusConfig,
     transaction::SignedTransaction,
     validator_signer::ValidatorSigner,
-    validator_verifier::random_validator_verifier,
+    validator_verifier::{generate_validator_verifier, random_validator_verifier},
     waypoint::Waypoint,
 };
 use channel::{self, aptos_channel, message_queues::QueueStyle};
-use consensus_types::timeout_2chain::TwoChainTimeoutWithPartialSignatures;
 use consensus_types::{
     block::{
         block_test_utils::{certificate_for_genesis, gen_test_certificate},
@@ -46,7 +44,7 @@ use consensus_types::{
     common::{Author, Payload, Round},
     proposal_msg::ProposalMsg,
     sync_info::SyncInfo,
-    timeout_2chain::TwoChainTimeout,
+    timeout_2chain::{TwoChainTimeout, TwoChainTimeoutWithPartialSignatures},
     vote_msg::VoteMsg,
 };
 use futures::{
@@ -66,7 +64,7 @@ use network::{
 };
 use safety_rules::{PersistentSafetyStorage, SafetyRulesManager};
 use std::{iter::FromIterator, sync::Arc, time::Duration};
-use tokio::runtime::Handle;
+use tokio::{runtime::Handle, time::timeout};
 
 /// Auxiliary struct that is setting up node environment for the test.
 pub struct NodeSetup {
@@ -204,7 +202,7 @@ impl NodeSetup {
             block_store.clone(),
             Arc::new(MockPayloadManager::new(None)),
             time_service.clone(),
-            1,
+            10,
             1000,
             10,
         );
@@ -215,6 +213,8 @@ impl NodeSetup {
             MetricsSafetyRules::new(safety_rules_manager.client(), storage.clone());
         safety_rules.perform_initialize().unwrap();
 
+        let (round_manager_tx, _) = aptos_channel::new(QueueStyle::LIFO, 1, None);
+
         let mut round_manager = RoundManager::new(
             epoch_state,
             Arc::clone(&block_store),
@@ -224,8 +224,9 @@ impl NodeSetup {
             Arc::new(Mutex::new(safety_rules)),
             network,
             storage.clone(),
-            false,
             OnChainConsensusConfig::default(),
+            round_manager_tx,
+            ConsensusConfig::default(),
         );
         block_on(round_manager.init(last_vote_sent));
         Self {
@@ -336,9 +337,70 @@ fn vote_on_successful_proposal() {
             genesis_qc.clone(),
             &node.signer,
             Vec::new(),
-        );
+        )
+        .unwrap();
         let proposal_id = proposal.id();
         node.round_manager.process_proposal(proposal).await.unwrap();
+        let vote_msg = node.next_vote().await;
+        assert_eq!(vote_msg.vote().author(), node.signer.author());
+        assert_eq!(vote_msg.vote().vote_data().proposed().id(), proposal_id);
+        let consensus_state = node.round_manager.consensus_state();
+        assert_eq!(consensus_state.epoch(), 1);
+        assert_eq!(consensus_state.last_voted_round(), 1);
+        assert_eq!(consensus_state.preferred_round(), 0);
+        assert_eq!(consensus_state.in_validator_set(), true);
+    });
+}
+
+#[test]
+/// In back pressure mode, verify that the proposals are processed after we get out of back pressure.
+fn delay_proposal_processing_in_sync_only() {
+    let mut runtime = consensus_runtime();
+    let mut playground = NetworkPlayground::new(runtime.handle().clone());
+    // In order to observe the votes we're going to check proposal processing on the non-proposer
+    // node (which will send the votes to the proposer).
+    let mut nodes = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 1);
+    let node = &mut nodes[0];
+
+    let genesis_qc = certificate_for_genesis();
+    timed_block_on(&mut runtime, async {
+        // Start round 1 and clear the message queue
+        node.next_proposal().await;
+
+        // Set sync only to true so that new proposal processing is delayed.
+        node.round_manager
+            .block_store
+            .set_back_pressure_for_test(true);
+        let proposal = Block::new_proposal(
+            Payload::empty(),
+            1,
+            1,
+            genesis_qc.clone(),
+            &node.signer,
+            Vec::new(),
+        )
+        .unwrap();
+        let proposal_id = proposal.id();
+        node.round_manager
+            .process_proposal(proposal.clone())
+            .await
+            .unwrap();
+
+        // Wait for some time to ensure that the proposal was not processed
+        timeout(Duration::from_millis(200), node.next_vote())
+            .await
+            .unwrap_err();
+
+        // Clear the sync only mode and process verified proposal and ensure it is processed now
+        node.round_manager
+            .block_store
+            .set_back_pressure_for_test(false);
+
+        node.round_manager
+            .process_verified_proposal(proposal)
+            .await
+            .unwrap();
+
         let vote_msg = node.next_vote().await;
         assert_eq!(vote_msg.vote().author(), node.signer.author());
         assert_eq!(vote_msg.vote().vote_data().proposed().id(), proposal_id);
@@ -368,10 +430,11 @@ fn no_vote_on_old_proposal() {
         genesis_qc.clone(),
         &node.signer,
         Vec::new(),
-    );
+    )
+    .unwrap();
     let new_block_id = new_block.id();
     let old_block =
-        Block::new_proposal(Payload::empty(), 1, 2, genesis_qc, &node.signer, Vec::new());
+        Block::new_proposal(Payload::empty(), 1, 2, genesis_qc, &node.signer, Vec::new()).unwrap();
     timed_block_on(&mut runtime, async {
         // clear the message queue
         node.next_proposal().await;
@@ -410,7 +473,8 @@ fn no_vote_on_mismatch_round() {
         genesis_qc.clone(),
         &node.signer,
         Vec::new(),
-    );
+    )
+    .unwrap();
     let block_skip_round = Block::new_proposal(
         Payload::empty(),
         2,
@@ -418,7 +482,8 @@ fn no_vote_on_mismatch_round() {
         genesis_qc.clone(),
         &node.signer,
         Vec::new(),
-    );
+    )
+    .unwrap();
     timed_block_on(&mut runtime, async {
         let bad_proposal = ProposalMsg::new(
             block_skip_round,
@@ -512,7 +577,8 @@ fn no_vote_on_invalid_proposer() {
         genesis_qc.clone(),
         &node.signer,
         Vec::new(),
-    );
+    )
+    .unwrap();
     let block_incorrect_proposer = Block::new_proposal(
         Payload::empty(),
         1,
@@ -520,7 +586,8 @@ fn no_vote_on_invalid_proposer() {
         genesis_qc.clone(),
         &incorrect_proposer.signer,
         Vec::new(),
-    );
+    )
+    .unwrap();
     timed_block_on(&mut runtime, async {
         let bad_proposal = ProposalMsg::new(
             block_incorrect_proposer,
@@ -561,7 +628,8 @@ fn new_round_on_timeout_certificate() {
         genesis_qc.clone(),
         &node.signer,
         Vec::new(),
-    );
+    )
+    .unwrap();
     let block_skip_round = Block::new_proposal(
         Payload::empty(),
         2,
@@ -569,9 +637,10 @@ fn new_round_on_timeout_certificate() {
         genesis_qc.clone(),
         &node.signer,
         vec![(1, node.signer.author())],
-    );
+    )
+    .unwrap();
     let timeout = TwoChainTimeout::new(1, 1, genesis_qc.clone());
-    let timeout_signature = timeout.sign(&node.signer);
+    let timeout_signature = timeout.sign(&node.signer).unwrap();
 
     let mut tc_partial = TwoChainTimeoutWithPartialSignatures::new(timeout.clone());
     tc_partial.add(node.signer.author(), timeout, timeout_signature);
@@ -614,7 +683,7 @@ fn reject_invalid_failed_authors() {
 
     let create_timeout = |round: Round| {
         let timeout = TwoChainTimeout::new(1, round, genesis_qc.clone());
-        let timeout_signature = timeout.sign(&node.signer);
+        let timeout_signature = timeout.sign(&node.signer).unwrap();
         let mut tc_partial = TwoChainTimeoutWithPartialSignatures::new(timeout.clone());
         tc_partial.add(node.signer.author(), timeout, timeout_signature);
 
@@ -631,7 +700,8 @@ fn reject_invalid_failed_authors() {
             genesis_qc.clone(),
             &node.signer,
             failed_authors,
-        );
+        )
+        .unwrap();
         ProposalMsg::new(
             block,
             SyncInfo::new(
@@ -705,7 +775,8 @@ fn response_on_block_retrieval() {
         genesis_qc.clone(),
         &node.signer,
         Vec::new(),
-    );
+    )
+    .unwrap();
     let block_id = block.id();
     let proposal = ProposalMsg::new(block, SyncInfo::new(genesis_qc.clone(), genesis_qc, None));
 
@@ -820,7 +891,7 @@ fn recover_on_restart() {
         tc_partial.add(
             inserter.signer().author(),
             timeout.clone(),
-            timeout.sign(inserter.signer()),
+            timeout.sign(inserter.signer()).unwrap(),
         );
 
         let tc = tc_partial

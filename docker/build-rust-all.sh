@@ -11,12 +11,9 @@ echo "PROFILE: $PROFILE"
 echo "FEATURES: $FEATURES"
 
 # Build all the rust binaries
-cargo build --profile=$PROFILE \
+cargo build --locked --profile=$PROFILE \
     -p aptos \
     -p aptos-faucet \
-    -p aptos-indexer \
-    -p aptos-sf-indexer \
-    -p aptos-node \
     -p aptos-node-checker \
     -p aptos-openapi-spec-generator \
     -p aptos-telemetry-service \
@@ -25,6 +22,11 @@ cargo build --profile=$PROFILE \
     -p db-bootstrapper \
     -p forge-cli \
     -p transaction-emitter \
+    "$@"
+
+# Build aptos-node separately
+cargo build --locked --profile=$PROFILE \
+    -p aptos-node \
     "$@"
 
 # Build and overwrite the aptos-node binary with features if specified
@@ -37,8 +39,6 @@ fi
 BINS=(
     aptos
     aptos-faucet
-    aptos-indexer
-    aptos-sf-indexer
     aptos-node
     aptos-node-checker
     aptos-openapi-spec-generator

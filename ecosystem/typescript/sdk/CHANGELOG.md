@@ -6,6 +6,35 @@ All notable changes to the Aptos Node SDK will be captured in this file. This ch
 
 ## Unreleased
 
+N/A
+
+## 1.3.16 (2022-10-12)
+
+- Add `estimatePrioritizedGasUnitPrice` to the simulation interface. If set to true, the estimated gas unit price is higher than the original estimate. Therefore, transactions have a higher chance to be executed during congestion period.
+- `esitmateGasPrice` now returns `deprioritized_gas_estimate` and `prioritized_gas_estimate` along with `gas_estimate`. `deprioritized_gas_estimate` is a conservative price estimate. Users might end up paying less gas eventually, but the transaction execution is deprioritized by the block chain. On the other hand, `prioritized_gas_estimate` is a higher price esitmate. Transactions need to be executed sooner could use `prioritized_gas_estimate`.
+
+## 1.3.15 (2022-09-30)
+
+- **[Breaking Changes]** Following the deprecation notice in the release notes of 1.3.13, the following breaking changes have landed in this release. Please see the notes from last release for information on the new endpoints you must migrate to:
+  - The `getEventsByEventKey` function has been removed.
+  - The `key` field in the `Event` struct has been removed.
+- Turn on `strict` in tsconfig
+
+## 1.3.14 (2022-09-20)
+
+- Enable SDK axios client to carry cookies for both the browser and node environments.
+- Added new functions `getBlockByHeight` and `getBlockByVersion`.
+
+## 1.3.13 (2022-09-15)
+
+- Increase the default wait time for `waitForTransactionWithResult` to 20s.
+- A new function called `getEventsByCreationNumber` has been added, corresponding to the new endpoint on the API. For more information on this change, see the [API changelog](https://github.com/aptos-labs/aptos-core/blob/main/api/doc/CHANGELOG.md) for API version 1.1.0.
+- **[Deprecated]** The `getEventsByEventKey` function is now deprecated. In the next release it will be removed entirely. You must migrate to the new function, `getEventsByCreationNumber`, by then.
+- Included in the `Event` struct (which is what the events endpoints return) is a new field called `guid`. This is a more easily interpretable representation of an event identifier than the `key` field. See the [API changelog](https://github.com/aptos-labs/aptos-core/blob/main/api/doc/CHANGELOG.md) for an example of the new field.
+- **[Deprecated]** The `key` field in the `Event` struct is now deprecated. In the next release it will be removed entirely. You must migrate to using the `guid` field by then.
+- Removed NPM dependencies ed25519-hd-key and typescript-memoize.
+- Added IIFE bundle that can be served from CDN. No NPM is required to use the SDK in browser environment.
+
 ## 1.3.12 (2022-09-08)
 
 - Feature to rotate auth key for single signature account

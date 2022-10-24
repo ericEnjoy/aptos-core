@@ -33,7 +33,7 @@ use short_hex_str::AsShortHexStr;
 use std::{collections::BTreeMap, convert::TryFrom, fmt, io, pin::Pin, sync::Arc, time::Duration};
 
 // Re-exposed for aptos-network-checker
-pub use netcore::transport::tcp::{resolve_and_connect, TcpSocket};
+pub use netcore::transport::tcp::{resolve_and_connect, TCPBufferCfg, TcpSocket};
 
 #[cfg(test)]
 mod test;
@@ -54,6 +54,8 @@ pub const APTOS_TCP_TRANSPORT: tcp::TcpTransport = tcp::TcpTransport {
     ttl: None,
     // Use TCP_NODELAY for Aptos tcp connections.
     nodelay: Some(true),
+    // Use default TCP setting, overridden by Network config
+    tcp_buff_cfg: tcp::TCPBufferCfg::new(),
 };
 
 /// A trait alias for "socket-like" things.
@@ -230,9 +232,9 @@ fn add_pp_addr(proxy_protocol_enabled: bool, error: io::Error, addr: &NetworkAdd
 
 /// Upgrade an inbound connection. This means we run a Noise IK handshake for
 /// authentication and then negotiate common supported protocols. If
-/// `ctxt.trusted_peers` is `Some(_)`, then we will only allow connections from
-/// peers with a pubkey in this set. Otherwise, we will allow inbound connections
-/// from any pubkey.
+/// `ctxt.noise.auth_mode` is `HandshakeAuthMode::Mutual( anti_replay_timestamps , trusted_peers )`,
+/// then we will only allow connections from peers with a pubkey in the `trusted_peers`
+/// set. Otherwise, we will allow inbound connections from any pubkey.
 async fn upgrade_inbound<T: TSocket>(
     ctxt: Arc<UpgradeContext>,
     fut_socket: impl Future<Output = io::Result<T>>,
@@ -322,7 +324,7 @@ async fn upgrade_inbound<T: TSocket>(
     })
 }
 
-/// Upgrade an inbound connection. This means we run a Noise IK handshake for
+/// Upgrade an outbound connection. This means we run a Noise IK handshake for
 /// authentication and then negotiate common supported protocols.
 pub async fn upgrade_outbound<T: TSocket>(
     ctxt: Arc<UpgradeContext>,

@@ -1,7 +1,7 @@
 // Copyright (c) Aptos
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::shared_mempool::types::{BatchId, QuorumStoreRequest};
+use crate::shared_mempool::types::{MultiBatchId, QuorumStoreRequest};
 use anyhow::Error;
 use aptos_config::network_id::{NetworkId, PeerNetworkId};
 use aptos_logger::Schema;
@@ -12,26 +12,44 @@ use std::{fmt, fmt::Write, time::SystemTime};
 
 pub struct TxnsLog {
     txns: Vec<(AccountAddress, u64, Option<String>, Option<SystemTime>)>,
+    len: usize,
+    max_displayed: usize,
 }
 
 impl TxnsLog {
     pub fn new() -> Self {
-        Self { txns: vec![] }
+        Self::new_with_max(usize::MAX)
+    }
+
+    pub fn new_with_max(max_displayed: usize) -> Self {
+        Self {
+            txns: vec![],
+            len: 0,
+            max_displayed,
+        }
     }
 
     pub fn new_txn(account: AccountAddress, seq_num: u64) -> Self {
         Self {
             txns: vec![(account, seq_num, None, None)],
+            len: 0,
+            max_displayed: usize::MAX,
         }
     }
 
     pub fn add(&mut self, account: AccountAddress, seq_num: u64) {
-        self.txns.push((account, seq_num, None, None));
+        if self.txns.len() < self.max_displayed {
+            self.txns.push((account, seq_num, None, None));
+        }
+        self.len += 1;
     }
 
     pub fn add_with_status(&mut self, account: AccountAddress, seq_num: u64, status: &str) {
-        self.txns
-            .push((account, seq_num, Some(status.to_string()), None));
+        if self.txns.len() < self.max_displayed {
+            self.txns
+                .push((account, seq_num, Some(status.to_string()), None));
+        }
+        self.len += 1;
     }
 
     pub fn add_full_metadata(
@@ -39,10 +57,17 @@ impl TxnsLog {
         account: AccountAddress,
         seq_num: u64,
         status: &str,
-        timestamp: Option<SystemTime>,
+        timestamp: SystemTime,
     ) {
-        self.txns
-            .push((account, seq_num, Some(status.to_string()), timestamp));
+        if self.txns.len() < self.max_displayed {
+            self.txns
+                .push((account, seq_num, Some(status.to_string()), Some(timestamp)));
+        }
+        self.len += 1;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
 }
 
@@ -62,7 +87,7 @@ impl fmt::Display for TxnsLog {
             write!(txns, "{} ", txn)?;
         }
 
-        write!(f, "{}", txns)
+        write!(f, "{}/{} txns: {}", self.txns.len(), self.len, txns)
     }
 }
 
@@ -87,7 +112,7 @@ pub struct LogSchema<'a> {
     network_level: Option<usize>,
     upstream_network: Option<&'a NetworkId>,
     #[schema(debug)]
-    batch_id: Option<&'a BatchId>,
+    batch_id: Option<&'a MultiBatchId>,
     backpressure: Option<bool>,
 }
 

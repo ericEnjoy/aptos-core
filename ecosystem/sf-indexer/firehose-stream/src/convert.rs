@@ -14,7 +14,7 @@ use aptos_logger::warn;
 use aptos_protos::extractor::v1 as extractor;
 use aptos_protos::util::timestamp;
 use hex;
-use move_deps::move_binary_format::file_format::Ability;
+use move_binary_format::file_format::Ability;
 use std::time::Duration;
 
 pub fn convert_move_module_id(move_module_id: &MoveModuleId) -> extractor::MoveModuleId {
@@ -437,10 +437,11 @@ pub fn convert_script_payload(script_payload: &ScriptPayload) -> extractor::Scri
 }
 
 pub fn convert_event(event: &Event) -> extractor::Event {
+    let event_key: aptos_types::event::EventKey = event.guid.into();
     extractor::Event {
         key: Some(extractor::EventKey {
-            creation_number: event.key.0.get_creation_number(),
-            account_address: event.key.0.get_creator_address().to_string(),
+            creation_number: event_key.get_creation_number(),
+            account_address: event_key.get_creator_address().to_string(),
         }),
         sequence_number: event.sequence_number.0,
         r#type: Some(convert_move_type(&event.typ)),

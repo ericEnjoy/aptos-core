@@ -4,6 +4,9 @@
 use crate::config::MAX_APPLICATION_MESSAGE_SIZE;
 use serde::{Deserialize, Serialize};
 
+pub const DEFAULT_BROADCAST_BUCKETS: &[u64] =
+    &[0, 150, 300, 500, 1000, 3000, 5000, 10000, 100000, 1000000];
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MempoolConfig {
@@ -23,6 +26,7 @@ pub struct MempoolConfig {
     pub system_transaction_timeout_secs: u64,
     pub system_transaction_gc_interval_ms: u64,
     pub shared_mempool_validator_broadcast: bool,
+    pub broadcast_buckets: Vec<u64>,
 }
 
 impl Default for MempoolConfig {
@@ -37,12 +41,13 @@ impl Default for MempoolConfig {
             max_broadcasts_per_peer: 1,
             mempool_snapshot_interval_secs: 180,
             capacity: 2_000_000,
-            capacity_bytes: 2_147_483_648,
+            capacity_bytes: 2 * 1024 * 1024 * 1024,
             capacity_per_user: 100,
             default_failovers: 3,
             system_transaction_timeout_secs: 600,
             system_transaction_gc_interval_ms: 60_000,
             shared_mempool_validator_broadcast: true,
+            broadcast_buckets: DEFAULT_BROADCAST_BUCKETS.to_vec(),
         }
     }
 }

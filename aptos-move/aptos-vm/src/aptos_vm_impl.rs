@@ -13,38 +13,44 @@ use crate::{
 use aptos_aggregator::transaction::TransactionOutputExt;
 use aptos_gas::{
     AbstractValueSizeGasParameters, AptosGasParameters, FromOnChainGasSchedule, Gas,
-    NativeGasParameters,
+    NativeGasParameters, StorageGasParameters,
 };
 use aptos_logger::prelude::*;
 use aptos_state_view::StateView;
+use aptos_types::on_chain_config::{FeatureFlag, Features};
 use aptos_types::transaction::AbortInfo;
 use aptos_types::{
     account_config::{TransactionValidation, APTOS_TRANSACTION_VALIDATION, CORE_CODE_ADDRESS},
-    on_chain_config::{ApprovedExecutionHashes, GasSchedule, OnChainConfig, Version},
+    on_chain_config::{
+        ApprovedExecutionHashes, GasSchedule, GasScheduleV2, OnChainConfig, StorageGasSchedule,
+        Version,
+    },
     transaction::{ExecutionStatus, TransactionOutput, TransactionStatus},
     vm_status::{StatusCode, VMStatus},
 };
 use dashmap::DashMap;
 use fail::fail_point;
 use framework::{RuntimeModuleMetadata, APTOS_METADATA_KEY};
-use move_deps::{
-    move_binary_format::{errors::VMResult, CompiledModule},
-    move_core_types::{
-        language_storage::ModuleId,
-        move_resource::MoveStructType,
-        resolver::ResourceResolver,
-        value::{serialize_values, MoveValue},
-    },
-    move_vm_runtime::logging::expect_no_verification_errors,
-    move_vm_types::gas::UnmeteredGasMeter,
+use move_binary_format::{errors::VMResult, CompiledModule};
+use move_core_types::{
+    language_storage::ModuleId,
+    move_resource::MoveStructType,
+    resolver::ResourceResolver,
+    value::{serialize_values, MoveValue},
 };
+use move_vm_runtime::logging::expect_no_verification_errors;
+use move_vm_types::gas::UnmeteredGasMeter;
 use std::sync::Arc;
+
+pub const MAXIMUM_APPROVED_TRANSACTION_SIZE: u64 = 1024 * 1024;
 
 #[derive(Clone)]
 /// A wrapper to make VMRuntime standalone and thread safe.
 pub struct AptosVMImpl {
     move_vm: Arc<MoveVmExt>,
+    gas_feature_version: u64,
     gas_params: Option<AptosGasParameters>,
+    storage_gas_params: Option<StorageGasParameters>,
     version: Option<Version>,
     transaction_validation: Option<TransactionValidation>,
     metadata_cache: DashMap<ModuleId, Option<RuntimeModuleMetadata>>,
@@ -55,13 +61,48 @@ impl AptosVMImpl {
     pub fn new<S: StateView>(state: &S) -> Self {
         let storage = StorageAdapter::new(state);
 
-        // TODO(Gas): this should not panic
-        let gas_params = GasSchedule::fetch_config(&storage).and_then(|gas_schedule| {
-            let gas_schedule = gas_schedule.to_btree_map();
-            AptosGasParameters::from_on_chain_gas_schedule(&gas_schedule)
-        });
+        // Get the gas parameters
+        let (mut gas_params, gas_feature_version): (Option<AptosGasParameters>, u64) =
+            match GasScheduleV2::fetch_config(&storage) {
+                Some(gas_schedule) => {
+                    let feature_version = gas_schedule.feature_version;
+                    let map = gas_schedule.to_btree_map();
+                    (
+                        AptosGasParameters::from_on_chain_gas_schedule(&map),
+                        feature_version,
+                    )
+                }
+                None => match GasSchedule::fetch_config(&storage) {
+                    Some(gas_schedule) => {
+                        let map = gas_schedule.to_btree_map();
+                        (AptosGasParameters::from_on_chain_gas_schedule(&map), 0)
+                    }
+                    None => (None, 0),
+                },
+            };
 
-        // TODO(Gas): this doesn't look right.
+        let storage_gas_params: Option<StorageGasParameters> = match gas_feature_version {
+            0 => None,
+            _ => StorageGasSchedule::fetch_config(&storage)
+                .map(|storage_gas_schedule| storage_gas_schedule.into()),
+        };
+
+        if gas_feature_version >= 2 {
+            if let (Some(gas_params), Some(storage_gas_params)) =
+                (&mut gas_params, &storage_gas_params)
+            {
+                gas_params.natives.table.common.load_base =
+                    u64::from(storage_gas_params.per_item_read).into();
+                gas_params.natives.table.common.load_per_byte =
+                    u64::from(storage_gas_params.per_byte_read).into();
+                gas_params.natives.table.common.load_failure = 0.into();
+            }
+        }
+
+        // TODO(Gas): Right now, we have to use some dummy values for gas parameters if they are not found on-chain.
+        //            This only happens in a edge case that is probably related to write set transactions or genesis,
+        //            which logically speaking, shouldn't be handled by the VM at all.
+        //            We should clean up the logic here once we get that refactored.
         let (native_gas_params, abs_val_size_gas_params) = match &gas_params {
             Some(gas_params) => (gas_params.natives.clone(), gas_params.misc.abs_val.clone()),
             None => (
@@ -70,12 +111,20 @@ impl AptosVMImpl {
             ),
         };
 
-        let inner = MoveVmExt::new(native_gas_params, abs_val_size_gas_params)
-            .expect("should be able to create Move VM; check if there are duplicated natives");
+        let features = Features::fetch_config(&storage).unwrap_or_default();
+        let inner = MoveVmExt::new(
+            native_gas_params,
+            abs_val_size_gas_params,
+            gas_feature_version,
+            features.is_enabled(FeatureFlag::TREAT_FRIEND_AS_PRIVATE),
+        )
+        .expect("should be able to create Move VM; check if there are duplicated natives");
 
         let mut vm = Self {
             move_vm: Arc::new(inner),
+            gas_feature_version,
             gas_params,
+            storage_gas_params,
             version: None,
             transaction_validation: None,
             metadata_cache: Default::default(),
@@ -85,22 +134,8 @@ impl AptosVMImpl {
         vm
     }
 
-    pub fn init_with_config(version: Version, gas_schedule: GasSchedule) -> Self {
-        // TODO(Gas): this should not panic
-        let gas_params =
-            AptosGasParameters::from_on_chain_gas_schedule(&gas_schedule.to_btree_map())
-                .expect("failed to get gas parameters");
-
-        let inner = MoveVmExt::new(gas_params.natives.clone(), gas_params.misc.abs_val.clone())
-            .expect("should be able to create Move VM; check if there are duplicated natives");
-
-        Self {
-            move_vm: Arc::new(inner),
-            gas_params: Some(gas_params),
-            version: Some(version),
-            transaction_validation: None,
-            metadata_cache: Default::default(),
-        }
+    pub(crate) fn mark_loader_cache_as_invalid(&self) {
+        self.move_vm.mark_loader_cache_as_invalid();
     }
 
     /// Provides access to some internal APIs of the VM.
@@ -138,6 +173,27 @@ impl AptosVMImpl {
         })
     }
 
+    pub fn get_storage_gas_parameters(
+        &self,
+        log_context: &AdapterLogSchema,
+    ) -> Result<Option<&StorageGasParameters>, VMStatus> {
+        match self.gas_feature_version {
+            0 => Ok(None),
+            _ => Ok(Some(self.storage_gas_params.as_ref().ok_or_else(|| {
+                log_context.alert();
+                error!(
+                    *log_context,
+                    "VM Startup Failed. Storage Gas Parameters Not Found"
+                );
+                VMStatus::Error(StatusCode::VM_STARTUP_FAILURE)
+            })?)),
+        }
+    }
+
+    pub fn get_gas_feature_version(&self) -> u64 {
+        self.gas_feature_version
+    }
+
     pub fn get_version(&self) -> Result<Version, VMStatus> {
         self.version.clone().ok_or_else(|| {
             CRITICAL_ERRORS.inc();
@@ -162,13 +218,23 @@ impl AptosVMImpl {
             let valid = if let Ok(Some(data)) = data {
                 let approved_execution_hashes =
                     bcs::from_bytes::<ApprovedExecutionHashes>(&data).ok();
-                approved_execution_hashes
+                let valid = approved_execution_hashes
                     .map(|aeh| {
                         aeh.entries
                             .into_iter()
                             .any(|(_, hash)| hash == txn_data.script_hash)
                     })
-                    .unwrap_or(false)
+                    .unwrap_or(false);
+                valid
+                    // If it is valid ensure that it is only the approved payload that exceeds the
+                    // maximum. The (unknown) user input should be restricted to the original
+                    // maximum transaction size.
+                    && (txn_data.script_size + txn_gas_params.max_transaction_size_in_bytes
+                        > txn_data.transaction_size)
+                    // Since an approved transaction can be sent by anyone, the system is safer by
+                    // enforcing an upper limit on governance transactions just so something really
+                    // bad doesn't happen.
+                    && txn_data.transaction_size <= MAXIMUM_APPROVED_TRANSACTION_SIZE.into()
             } else {
                 false
             };
@@ -457,6 +523,7 @@ impl AptosVMImpl {
         r: &'r R,
         session_id: SessionId,
     ) -> SessionExt<'r, '_, R> {
+        self.metadata_cache.clear();
         self.move_vm.new_session(r, session_id)
     }
 
@@ -519,6 +586,7 @@ pub(crate) fn get_transaction_output<A: AccessPathCache, S: MoveResolverExt>(
     gas_left: Gas,
     txn_data: &TransactionMetadata,
     status: ExecutionStatus,
+    gas_feature_version: u64,
 ) -> Result<TransactionOutputExt, VMStatus> {
     let gas_used = txn_data
         .max_gas_amount()
@@ -526,7 +594,7 @@ pub(crate) fn get_transaction_output<A: AccessPathCache, S: MoveResolverExt>(
         .expect("Balance should always be less than or equal to max gas amount");
 
     let session_out = session.finish().map_err(|e| e.into_vm_status())?;
-    let change_set_ext = session_out.into_change_set(ap_cache)?;
+    let change_set_ext = session_out.into_change_set(ap_cache, gas_feature_version)?;
     let (delta_change_set, change_set) = change_set_ext.into_inner();
     let (write_set, events) = change_set.into_inner();
 
